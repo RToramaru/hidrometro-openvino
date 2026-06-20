@@ -4,10 +4,11 @@ import openvino as ov
 import math
 import time
 import threading
+import os
 import tkinter as tk
-from tkinter import filedialog
+from tkinter import filedialog, messagebox
 import customtkinter as ctkinter
-from PIL import Image, ImageTk
+from PIL import Image
 
 # =========================================================
 # CONFIGURAÇÕES GERAIS E CAMINHOS DOS MODELOS
@@ -28,9 +29,21 @@ CONF_THRESHOLD_YOLO = 0.4
 CONF_THRESHOLD_POSE = 0.25
 CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
-# Configuração de Aparência do CustomTkinter
 ctkinter.set_appearance_mode("Dark")
 ctkinter.set_default_color_theme("blue")
+
+
+# =========================================================
+# FUNÇÃO AUXILIAR PARA DETECTAR CÂMERAS DISPONÍVEIS
+# =========================================================
+def listar_cameras_disponiveis():
+    cameras = []
+    for i in range(5):
+        cap = cv2.VideoCapture(i, cv2.CAP_DSHOW if os.name == 'nt' else cv2.CAP_ANY)
+        if cap.isOpened():
+            cameras.append(i)
+            cap.release()
+    return cameras
 
 
 # =========================================================
@@ -39,30 +52,24 @@ ctkinter.set_default_color_theme("blue")
 class HybridInferenceEngine:
     def __init__(self):
         self.backend = "CPU"
-        self.ort_session = None
-        self.ov_compiled_model = None
-        self.ov_infer_request = None
         self.core = ov.Core()
         self.core.set_property({'CACHE_DIR': './ov_cache_dir'})
 
         try:
             import onnxruntime as ort
-            available_providers = ort.get_available_providers()
-            if "CUDAExecutionProvider" in available_providers:
+            if "CUDAExecutionProvider" in ort.get_available_providers():
                 self.backend = "CUDA"
                 self.ort = ort
-                print("[Engine] CUDA (NVIDIA) detetado com sucesso via ONNX Runtime.")
+                print("[Engine] CUDA ativa via ONNX Runtime.")
         except ImportError:
             pass
 
         if self.backend == "CPU":
-            ov_devices = self.core.available_devices
-            if any("GPU" in dev for dev in ov_devices):
+            if any("GPU" in dev for dev in self.core.available_devices):
                 self.backend = "OPENVINO_GPU"
             else:
                 self.backend = "OPENVINO_CPU"
-
-        print(f"--> [BACKEND SELECIONADO]: {self.backend}\n")
+        print(f"--> [BACKEND GLOBAL SELECIONADO]: {self.backend}\n")
 
     def load_model(self, model_keys, target_forced_backend=None):
         backend_atual = target_forced_backend if target_forced_backend else self.backend
@@ -70,29 +77,20 @@ class HybridInferenceEngine:
         engine.backend = backend_atual
 
         if backend_atual == "CUDA":
-            onnx_path = model_keys["onnx"]
             engine.ort_session = self.ort.InferenceSession(
-                onnx_path,
-                providers=['CUDAExecutionProvider', 'CPUExecutionProvider']
+                model_keys["onnx"], providers=['CUDAExecutionProvider', 'CPUExecutionProvider']
             )
             engine.input_name = engine.ort_session.get_inputs()[0].name
         else:
-            xml_path = model_keys["xml"]
             device = "GPU" if backend_atual == "OPENVINO_GPU" else "CPU"
-            config = {"PERFORMANCE_HINT": "LATENCY"} if device == "GPU" else {"INFERENCE_NUM_THREADS": "0"}
-
             try:
-                model = self.core.read_model(xml_path)
-                engine.ov_model = model
-                engine.ov_compiled_model = self.core.compile_model(model, device, config)
+                model = self.core.read_model(model_keys["xml"])
+                engine.ov_compiled_model = self.core.compile_model(model, device, {"PERFORMANCE_HINT": "LATENCY"})
             except Exception:
                 engine.backend = "OPENVINO_CPU"
-                model = self.core.read_model(xml_path)
-                engine.ov_model = model
+                model = self.core.read_model(model_keys["xml"])
                 engine.ov_compiled_model = self.core.compile_model(model, "CPU", {"INFERENCE_NUM_THREADS": "0"})
-
             engine.ov_infer_request = engine.ov_compiled_model.create_infer_request()
-
         return engine
 
 
@@ -100,15 +98,13 @@ class HybridInferenceEngineInstance:
     def __init__(self):
         self.backend = None
         self.ort_session = None
-        self.ov_model = None
         self.ov_compiled_model = None
         self.ov_infer_request = None
         self.input_name = None
 
     def infer(self, tensor_input):
         if self.backend == "CUDA":
-            outputs = self.ort_session.run(None, {self.input_name: tensor_input})
-            return outputs[0]
+            return self.ort_session.run(None, {self.input_name: tensor_input})[0]
         else:
             self.ov_infer_request.start_async([tensor_input])
             self.ov_infer_request.wait()
@@ -130,129 +126,85 @@ def letterbox(im, new_shape=(640, 640), color=(114, 114, 114)):
 
 
 # =========================================================
-# INTERFACE GRÁFICA PRINCIPAL (LEVE)
+# COMPONENTE DE CADA INSTÂNCIA DE VÍDEO/CÂMERA
 # =========================================================
-class AppMedidor(ctkinter.CTk):
-    def __init__(self):
-        super().__init__()
+class VideoInstanceFrame(ctkinter.CTkFrame):
+    def __init__(self, master, app_master, video_source, titulo_nome):
+        super().__init__(master, fg_color="#2b2b2b", border_color="#3a3a3a", border_width=1)
+        self.app_master = app_master
+        self.video_source = video_source
 
-        self.title("Sistema de Monitoramento Otimizado")
-        self.geometry("1100x720")
-        self.configure(fg_color="#1e1e1e")
-
-        # Controle de Estado da Thread de Vídeo
-        self.cap = None
-        self.running = False
-        self.paused = False
-        self.video_source = None
-        self.video_thread = None
-
-        # Instancia as Engines uma única vez para economizar memória
-        self.master_engine = HybridInferenceEngine()
-        print("A carregar pipeline de modelos...")
-        self.model_visor = self.master_engine.load_model(MODELOS["visor"])
-        self.model_yolo = self.master_engine.load_model(MODELOS["yolo"])
-        self.model_ocr = self.master_engine.load_model(MODELOS["ocr"], target_forced_backend="OPENVINO_CPU")
-        self.model_pose = self.master_engine.load_model(MODELOS["yolo_pose"])
-
-        self.construir_interface()
-
-    def construir_interface(self):
-        # --- Top Menu Bar ---
-        self.top_bar = ctkinter.CTkFrame(self, height=60, fg_color="#2b2b2b", corner_radius=0)
-        self.top_bar.pack(side="top", fill="x", padx=10, pady=10)
-
-        self.btn_camera = ctkinter.CTkButton(self.top_bar, text="📷 Câmera Local", font=("Arial", 13, "bold"), fg_color="#007acc", hover_color="#005999", command=self.iniciar_camera)
-        self.btn_camera.pack(side="left", padx=15, pady=12)
-
-        self.btn_arquivo = ctkinter.CTkButton(self.top_bar, text="📁 Arquivo de Vídeo", font=("Arial", 13, "bold"), fg_color="#007acc", hover_color="#005999", command=self.abrir_arquivo)
-        self.btn_arquivo.pack(side="left", padx=5, pady=12)
-
-        # --- Área Central ---
-        self.main_container = ctkinter.CTkFrame(self, fg_color="transparent")
-        self.main_container.pack(side="top", fill="both", expand=True, padx=10, pady=5)
-
-        # Container Esquerdo (Vídeo + Status)
-        self.left_container = ctkinter.CTkFrame(self.main_container, width=360, fg_color="#2b2b2b", border_color="#3a3a3a", border_width=1)
-        self.left_container.pack(side="left", fill="both", expand=False, padx=(0, 10))
-
-        # Cabeçalho do arquivo
-        self.lbl_nome_arquivo = ctkinter.CTkLabel(self.left_container, text="Nenhum arquivo carregado", font=("Arial", 12, "bold"), text_color="#ffffff", anchor="w")
-        self.lbl_nome_arquivo.pack(fill="x", padx=15, pady=(10, 5))
-
-        # Viewport de Imagem
-        self.video_canvas = ctkinter.CTkLabel(self.left_container, text="", fg_color="#000000", width=330, height=330)
-        self.video_canvas.pack(padx=15, pady=5)
-
-        # Painel de Telemetria (Verde Escuro)
-        self.telemetria_frame = ctkinter.CTkFrame(self.left_container, fg_color="#182515", border_color="#2a4025", border_width=1)
-        self.telemetria_frame.pack(fill="x", padx=15, pady=10)
-
-        self.lbl_ocr = ctkinter.CTkLabel(self.telemetria_frame, text="OCR: ...", font=("Consolas", 14, "bold"), text_color="#00ff00", anchor="w")
-        self.lbl_ocr.pack(fill="x", padx=15, pady=(8, 2))
-
-        self.lbl_ponteiros = ctkinter.CTkLabel(self.telemetria_frame, text="Ponteiros: ...", font=("Consolas", 14, "bold"), text_color="#00ff00", anchor="w")
-        self.lbl_ponteiros.pack(fill="x", padx=15, pady=(2, 8))
-
-        # Botões de Controle Inferiores
-        self.control_bar = ctkinter.CTkFrame(self.left_container, fg_color="transparent")
-        self.control_bar.pack(fill="x", padx=15, pady=(5, 15))
-
-        self.btn_pausa = ctkinter.CTkButton(self.control_bar, text="▶ Retomar", width=80, fg_color="#4a4a4a", hover_color="#5a5a5a", command=self.alternar_pausa)
-        self.btn_pausa.pack(side="left", padx=(0, 5))
-
-        self.btn_gravar = ctkinter.CTkButton(self.control_bar, text="🟠 Gravar", width=80, fg_color="#e64a19", hover_color="#bf360c")
-        self.btn_gravar.pack(side="left", padx=5)
-
-        self.chk_onnx = ctkinter.CTkCheckBox(self.control_bar, text="Processamento ONNX", font=("Arial", 11), fg_color="#007acc")
-        self.chk_onnx.select()
-        self.chk_onnx.pack(side="left", padx=10)
-
-        # Painel Direito Espaçador
-        self.right_container = ctkinter.CTkFrame(self.main_container, fg_color="#1e1e1e", border_color="#2b2b2b", border_width=1)
-        self.right_container.pack(side="right", fill="both", expand=True)
-
-    def abrir_arquivo(self):
-        caminho = filedialog.askopenfilename(filetypes=[("Vídeos", "*.mp4 *.avi *.mkv")])
-        if caminho:
-            self.lbl_nome_arquivo.configure(text=f"🎥 {caminho.split('/')[-1]}  •  Processando")
-            self.iniciar_processamento(caminho)
-
-    def iniciar_camera(self):
-        self.lbl_nome_arquivo.configure(text="🎥 Câmera Local Ativa  •  Live")
-        self.iniciar_processamento(0)
-
-    def iniciar_processamento(self, fonte):
-        self.parar_processamento()
+        # Estados da Instância
         self.running = True
         self.paused = False
-        self.btn_pausa.configure(text="⏸ Pausar")
-        self.video_source = fonte
-        self.video_thread = threading.Thread(target=self.loop_video_pipeline, daemon=True)
-        self.video_thread.start()
+        self.recording = False
+        self.video_writer = None
+
+        # Componentes de UI internos
+        self.top_info = ctkinter.CTkFrame(self, fg_color="transparent")
+        self.top_info.pack(fill="x", padx=10, pady=(5, 2))
+
+        self.lbl_nome = ctkinter.CTkLabel(self.top_info, text=titulo_nome, font=("Arial", 11, "bold"), text_color="#ffffff", anchor="w")
+        self.lbl_nome.pack(side="left", fill="x", expand=True)
+
+        self.btn_fechar = ctkinter.CTkButton(self.top_info, text="✕ Close", width=55, height=20, fg_color="#c62828", hover_color="#b71c1c", font=("Arial", 10, "bold"), command=self.fechar_instancia)
+        self.btn_fechar.pack(side="right")
+
+        # Viewport da Câmera (Usa CTkLabel)
+        self.video_canvas = ctkinter.CTkLabel(self, text="", fg_color="#000000", width=280, height=240)
+        self.video_canvas.pack(padx=10, pady=2)
+
+        # Telemetria dedicada
+        self.telemetria_frame = ctkinter.CTkFrame(self, fg_color="#182515", border_color="#2a4025", border_width=1)
+        self.telemetria_frame.pack(fill="x", padx=10, pady=4)
+
+        self.lbl_ocr = ctkinter.CTkLabel(self.telemetria_frame, text="OCR: ...", font=("Consolas", 12, "bold"), text_color="#00ff00", anchor="w")
+        self.lbl_ocr.pack(fill="x", padx=10, pady=(4, 1))
+
+        self.lbl_ponteiros = ctkinter.CTkLabel(self.telemetria_frame, text="Ponteiros: ...", font=("Consolas", 12, "bold"), text_color="#00ff00", anchor="w")
+        self.lbl_ponteiros.pack(fill="x", padx=10, pady=(1, 4))
+
+        # Controles locais
+        self.control_bar = ctkinter.CTkFrame(self, fg_color="transparent")
+        self.control_bar.pack(fill="x", padx=10, pady=(2, 8))
+
+        self.btn_pausa = ctkinter.CTkButton(self.control_bar, text="⏸ Pausar", width=80, height=25, fg_color="#4a4a4a", hover_color="#5a5a5a", font=("Arial", 11), command=self.alternar_pausa)
+        self.btn_pausa.pack(side="left", padx=(0, 5))
+
+        self.btn_gravar = ctkinter.CTkButton(self.control_bar, text="🟠 Gravar", width=80, height=25, fg_color="#e64a19", hover_color="#bf360c", font=("Arial", 11), command=self.alternar_gravacao)
+        self.btn_gravar.pack(side="left", padx=5)
+
+        # Dispara thread de processamento desta instância
+        self.thread = threading.Thread(target=self.loop_pipeline, daemon=True)
+        self.thread.start()
 
     def alternar_pausa(self):
-        if self.running:
-            self.paused = not self.paused
-            if self.paused:
-                self.btn_pausa.configure(text="▶ Retomar")
-                self.lbl_nome_arquivo.configure(text=self.lbl_nome_arquivo.cget("text").split("•")[0] + " • Pausado")
-            else:
-                self.btn_pausa.configure(text="⏸ Pausar")
-                self.lbl_nome_arquivo.configure(text=self.lbl_nome_arquivo.cget("text").split("•")[0] + " • Processando")
+        self.paused = not self.paused
+        self.btn_pausa.configure(text="▶ Retomar" if self.paused else "⏸ Pausar")
 
-    def parar_processamento(self):
+    def alternar_gravacao(self):
+        if not self.recording:
+            timestamp = time.strftime("%Y%m%d-%H%M%S")
+            filename = f"gravacao_{timestamp}_{np.random.randint(100,999)}.mp4"
+            self.output_filename = filename
+            self.recording = True
+            self.btn_gravar.configure(text="🔴 Parar", fg_color="#b71c1c", hover_color="#7f0000")
+        else:
+            self.recording = False
+            self.btn_gravar.configure(text="🟠 Gravar", fg_color="#e64a19", hover_color="#bf360c")
+            if self.video_writer:
+                self.video_writer.release()
+                self.video_writer = None
+                messagebox.showinfo("Gravação Concluída", f"Vídeo salvo com sucesso como:\n{self.output_filename}")
+
+    def fechar_instancia(self):
         self.running = False
-        if self.video_thread and self.video_thread.is_alive():
-            self.video_thread.join(timeout=1.0)
-        if self.cap:
-            self.cap.release()
+        if self.video_writer:
+            self.video_writer.release()
+        self.app_master.remover_instancia_grid(self)
 
-    # =========================================================
-    # PIPELINE INTEGRADO FIXO EM BATCH 1 (EVITA ERRO DE RESHAPE)
-    # =========================================================
-    def loop_video_pipeline(self):
-        self.cap = cv2.VideoCapture(self.video_source)
+    def loop_pipeline(self):
+        cap = cv2.VideoCapture(self.video_source)
         
         calibrado = False
         rotation_step = None
@@ -277,19 +229,27 @@ class AppMedidor(ctkinter.CTk):
                 time.sleep(0.03)
                 continue
 
-            ret, frame = self.cap.read()
+            ret, frame = cap.read()
             if not ret:
                 break
+
+            if self.recording:
+                if self.video_writer is None:
+                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                    fps = cap.get(cv2.CAP_PROP_FPS)
+                    if fps <= 0 or math.isnan(fps): fps = 30.0
+                    self.video_writer = cv2.VideoWriter(self.output_filename, fourcc, fps, (frame.shape[1], frame.shape[0]))
+                self.video_writer.write(frame)
 
             h_orig, w_orig = frame.shape[:2]
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-            # --- ETAPA DE CALIBRAÇÃO (APENAS FRAME 1) ---
+            # --- ETAPA DE CALIBRAÇÃO ---
             if not calibrado:
                 seg_inp = cv2.resize(frame_rgb, (SEG_SIZE, SEG_SIZE)).transpose(2, 0, 1)[None, ...].astype(np.float32, copy=False) / 255.0
                 seg_inp = np.ascontiguousarray(seg_inp)
 
-                pred_seg = self.model_visor.infer(seg_inp)
+                pred_seg = self.app_master.model_visor.infer(seg_inp)
                 mask_prob = 1 / (1 + np.exp(-pred_seg))
                 mask_v = (np.squeeze(mask_prob) > THRESHOLD_UNET).astype(np.uint8)
                 mask_v = cv2.resize(mask_v, (w_orig, h_orig), interpolation=cv2.INTER_NEAREST)
@@ -305,7 +265,7 @@ class AppMedidor(ctkinter.CTk):
                 yolo_inp = inp_img.transpose(2, 0, 1)[None, ...].astype(np.float32, copy=False) / 255.0
                 yolo_inp = np.ascontiguousarray(yolo_inp)
 
-                saida_bruta_yolo = self.model_yolo.infer(yolo_inp)
+                saida_bruta_yolo = self.app_master.model_yolo.infer(yolo_inp)
                 saida_bruta_yolo = np.squeeze(saida_bruta_yolo)
                 if len(saida_bruta_yolo.shape) == 1:
                     saida_bruta_yolo = np.expand_dims(saida_bruta_yolo, axis=0)
@@ -392,7 +352,7 @@ class AppMedidor(ctkinter.CTk):
                 seg_inp_est = cv2.resize(frame_piloto_est_rgb, (SEG_SIZE, SEG_SIZE)).transpose(2, 0, 1)[None, ...].astype(np.float32, copy=False) / 255.0
                 seg_inp_est = np.ascontiguousarray(seg_inp_est)
 
-                pred_seg_est = self.model_visor.infer(seg_inp_est)
+                pred_seg_est = self.app_master.model_visor.infer(seg_inp_est)
                 mask_v_est = (np.squeeze(1 / (1 + np.exp(-pred_seg_est))) > THRESHOLD_UNET).astype(np.uint8)
                 mask_v_est = cv2.resize(mask_v_est, (w_est, h_est), interpolation=cv2.INTER_NEAREST)
                 contours_est, _ = cv2.findContours(mask_v_est, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -402,7 +362,7 @@ class AppMedidor(ctkinter.CTk):
                 inp_img_est, ratio_est, dw_est, dh_est = letterbox(frame_piloto_est_rgb, new_shape=(YOLO_SIZE, YOLO_SIZE))
                 yolo_inp_est = inp_img_est.transpose(2, 0, 1)[None, ...].astype(np.float32, copy=False) / 255.0
                 yolo_inp_est = np.ascontiguousarray(yolo_inp_est)
-                saida_bruta_yolo_est = self.model_yolo.infer(yolo_inp_est)
+                saida_bruta_yolo_est = self.app_master.model_yolo.infer(yolo_inp_est)
 
                 saida_bruta_yolo_est = np.squeeze(saida_bruta_yolo_est)
                 if len(saida_bruta_yolo_est.shape) == 1:
@@ -413,7 +373,7 @@ class AppMedidor(ctkinter.CTk):
                     if len(pred) < 5 or pred[4] < CONF_THRESHOLD_YOLO: continue
                     ponteiros_validos.append([
                         int(max(0, (pred[0] - dw_est) / ratio_est)), int(max(0, (pred[1] - dh_est) / ratio_est)),
-                        int(min(w_est, (pred[2] - dw_est) / ratio_est)), int(min(h_est, (pred[3] - dh_est) / ratio_est))
+                        int(min(w_est, (pred[2] - dw_est) / ratio_est)), int(min(h_est, (pred[3] - dw_est) / ratio_est))
                     ])
                 caixas_ponteiros_estaticas = sorted(ponteiros_validos, key=lambda p: p[1])
 
@@ -437,7 +397,7 @@ class AppMedidor(ctkinter.CTk):
                         crop_padded[top:top + crop_resized.shape[0], left:left + crop_resized.shape[1]] = crop_resized
                         
                         tensor_single = crop_padded.transpose(2, 0, 1)[None, ...].astype(np.float32, copy=False) / 255.0
-                        preds_pose_single = self.model_pose.infer(tensor_single)
+                        preds_pose_single = self.app_master.model_pose.infer(tensor_single)
                         
                         single_pred = np.squeeze(preds_pose_single)
                         if len(single_pred.shape) == 1: single_pred = np.expand_dims(single_pred, axis=0)
@@ -450,7 +410,7 @@ class AppMedidor(ctkinter.CTk):
                                 angulo = math.degrees(math.atan2((kpts[4] - dh_p) / r_p - (kpts[1] - dh_p) / r_p, (kpts[3] - dw_p) / r_p - (kpts[0] - dw_p) / r_p)) + 90.0
                                 if angulo < 0: angulo += 360.0
                                 val = round((angulo % 360.0) / 36.0, 1)
-                                if val >= 10.0 or val == 10: val = 0.0
+                                if val >= 10.0: val = 0.0
                                 p_superior_estatico = int(round(val))
 
                 calibrado = True
@@ -461,7 +421,6 @@ class AppMedidor(ctkinter.CTk):
 
             frame_estabilizado_rgb = cv2.remap(frame_rgb, map_x, map_y, cv2.INTER_LINEAR)
 
-            # 1. Processar Ponteiro Inferior (Índice 1) Se existir
             if len(caixas_ponteiros_estaticas) > 1:
                 x1, y1, x2, y2 = caixas_ponteiros_estaticas[1]
                 crop_p_rgb = frame_estabilizado_rgb[y1:y2, x1:x2]
@@ -473,7 +432,7 @@ class AppMedidor(ctkinter.CTk):
                     crop_padded[top:top + crop_resized.shape[0], left:left + crop_resized.shape[1]] = crop_resized
 
                     tensor_inf = crop_padded.transpose(2, 0, 1)[None, ...].astype(np.float32, copy=False) / 255.0
-                    preds_pose_inf = self.model_pose.infer(tensor_inf)
+                    preds_pose_inf = self.app_master.model_pose.infer(tensor_inf)
 
                     single_pred = np.squeeze(preds_pose_inf)
                     if len(single_pred.shape) == 1: single_pred = np.expand_dims(single_pred, axis=0)
@@ -489,9 +448,8 @@ class AppMedidor(ctkinter.CTk):
                             angulo_ajustated = math.degrees(math.atan2((kpts[4] - dh_p) / r_p - (kpts[1] - dh_p) / r_p, (kpts[3] - dw_p) / r_p - (kpts[0] - dw_p) / r_p)) + 90.0
                             if angulo_ajustated < 0: angulo_ajustated += 360.0
                             valor_original = round((angulo_ajustated % 360.0) / 36.0, 1)
-                            if valor_original >= 10.0 or valor_original == 10: valor_original = 0.0
+                            if valor_original >= 10.0: valor_original = 0.0
 
-                            # REGRA DE ARREDONDAMENTO ORIGINAL RESTAURADA
                             decimais = int(round((valor_original - int(valor_original)) * 10))
                             if decimais % 2 != 0:
                                 valor_original = round(valor_original - 0.1, 1)
@@ -502,11 +460,9 @@ class AppMedidor(ctkinter.CTk):
                 else: p_inferior_cache = 0.0
             else: p_inferior_cache = 0.0
 
-            # REGRA DE SALTO/ZERAGEM DO PONTEIRO INFERIOR
             completou_volta = (p_inferior_cache == 0.0) or (p_inferior_anterior > 5.0 and p_inferior_cache < 1.0)
             p_inferior_anterior = p_inferior_cache
 
-            # 2. Processar Ponteiro Superior (Apenas se completou a volta)
             if completou_volta and len(caixas_ponteiros_estaticas) > 0:
                 x1, y1, x2, y2 = caixas_ponteiros_estaticas[0]
                 crop_p_rgb = frame_estabilizado_rgb[y1:y2, x1:x2]
@@ -518,7 +474,7 @@ class AppMedidor(ctkinter.CTk):
                     crop_padded[top:top + crop_resized.shape[0], left:left + crop_resized.shape[1]] = crop_resized
 
                     tensor_sup = crop_padded.transpose(2, 0, 1)[None, ...].astype(np.float32, copy=False) / 255.0
-                    preds_pose_sup = self.model_pose.infer(tensor_sup)
+                    preds_pose_sup = self.app_master.model_pose.infer(tensor_sup)
 
                     single_pred = np.squeeze(preds_pose_sup)
                     if len(single_pred.shape) == 1: single_pred = np.expand_dims(single_pred, axis=0)
@@ -534,7 +490,7 @@ class AppMedidor(ctkinter.CTk):
                             angulo_ajustated = math.degrees(math.atan2((kpts[4] - dh_p) / r_p - (kpts[1] - dh_p) / r_p, (kpts[3] - dw_p) / r_p - (kpts[0] - dw_p) / r_p)) + 90.0
                             if angulo_ajustated < 0: angulo_ajustated += 360.0
                             valor_original = round((angulo_ajustated % 360.0) / 36.0, 1)
-                            if valor_original >= 10.0 or valor_original == 10: valor_original = 0.0
+                            if valor_original >= 10.0: valor_original = 0.0
 
                             p_superior_estatico = int(round(valor_original))
                             p_superior_cache = p_superior_estatico
@@ -544,7 +500,6 @@ class AppMedidor(ctkinter.CTk):
             else:
                 p_superior_cache = p_superior_estatico
 
-            # --- CONTROLE DO OCR ---
             deve_processar_ocr = False
             if not ocr_inicial_realizado: deve_processar_ocr = True
             elif p_superior_cache == 0 and p_inferior_cache == 0.0 and not ocr_no_zero_realizado: deve_processar_ocr = True
@@ -559,7 +514,7 @@ class AppMedidor(ctkinter.CTk):
                     crop_resized = cv2.resize(crop_gray, (128, 32), interpolation=cv2.INTER_LINEAR)
                     buffer_ocr_inp[0, 0, :, :] = crop_resized / 255.0
 
-                    pred_ocr = self.model_ocr.infer(buffer_ocr_inp)
+                    pred_ocr = self.app_master.model_ocr.infer(buffer_ocr_inp)
                     pred_argmax = np.argmax(pred_ocr, axis=2).flatten()
 
                     texto_temp = ""
@@ -574,25 +529,127 @@ class AppMedidor(ctkinter.CTk):
                         if not ocr_inicial_realizado: ocr_inicial_realizado = True
                         elif p_superior_cache == 0 and p_inferior_cache == 0.0: ocr_no_zero_realizado = True
 
-            # --- ATUALIZAR INTERFACE (SEGURA COM THREADS) ---
             self.atualizar_ui_elementos(frame_estabilizado_rgb, texto_ocr_cache, p_superior_cache, p_inferior_cache)
 
-        if self.cap:
-            self.cap.release()
+        cap.release()
 
     def atualizar_ui_elementos(self, frame_rgb, ocr, p_sup, p_inf):
-        frame_resized = cv2.resize(frame_rgb, (330, 330), interpolation=cv2.INTER_AREA)
+        frame_resized = cv2.resize(frame_rgb, (280, 240), interpolation=cv2.INTER_AREA)
         img_pil = Image.fromarray(frame_resized)
-        img_tk = ImageTk.PhotoImage(image=img_pil)
-        self.after(0, self._set_labels_and_image, img_tk, ocr, p_sup, p_inf)
+        
+        # Corrigido para CTkImage para evitar o Warning de HighDPI do CustomTkinter
+        img_ctk = ctkinter.CTkImage(light_image=img_pil, dark_image=img_pil, size=(280, 240))
+        self.after(0, self._set_labels_and_image, img_ctk, ocr, p_sup, p_inf)
 
-    def _set_labels_and_image(self, img_tk, ocr, p_sup, p_inf):
-        self.video_canvas.configure(image=img_tk)
-        self.video_canvas.image = img_tk  
+    def _set_labels_and_image(self, img_ctk, ocr, p_sup, p_inf):
+        if not self.running: return
+        self.video_canvas.configure(image=img_ctk)
+        self.video_canvas.image = img_ctk  
         self.lbl_ocr.configure(text=f"OCR: {ocr}")
         self.lbl_ponteiros.configure(text=f"Ponteiros: {p_sup} | {p_inf:.1f}")
 
 
+# =========================================================
+# INTERFACE GRÁFICA PRINCIPAL MÚLTIPLAS INSTÂNCIAS
+# =========================================================
+class AppMedidorMultiplo(ctkinter.CTk):
+    def __init__(self):
+        super().__init__()
+
+        self.title("Sistema de Monitoramento Multicâmera Otimizado")
+        self.geometry("1280x760")
+        self.configure(fg_color="#1e1e1e")
+
+        # Corrigido aqui: Inicializa corretamente a variável usada na gerência do grid
+        self.instancias_ativas = []
+
+        # Instancia as Engines uma única vez para economizar memória global
+        self.master_engine = HybridInferenceEngine()
+        print("A carregar pipeline de modelos compartilhados...")
+        self.model_visor = self.master_engine.load_model(MODELOS["visor"])
+        self.model_yolo = self.master_engine.load_model(MODELOS["yolo"])
+        self.model_ocr = self.master_engine.load_model(MODELOS["ocr"], target_forced_backend="OPENVINO_CPU")
+        self.model_pose = self.master_engine.load_model(MODELOS["yolo_pose"])
+
+        self.construir_interface_principal()
+
+    def construir_interface_principal(self):
+        # Top Menu Bar
+        self.top_bar = ctkinter.CTkFrame(self, height=60, fg_color="#2b2b2b", corner_radius=0)
+        self.top_bar.pack(side="top", fill="x", padx=10, pady=10)
+
+        self.btn_camera = ctkinter.CTkButton(self.top_bar, text="📷 Câmera Local", font=("Arial", 13, "bold"), fg_color="#007acc", hover_color="#005999", command=self.abrir_janela_selecao_camera)
+        self.btn_camera.pack(side="left", padx=15, pady=12)
+
+        self.btn_arquivo = ctkinter.CTkButton(self.top_bar, text="📁 Adicionar Vídeo", font=("Arial", 13, "bold"), fg_color="#007acc", hover_color="#005999", command=self.adicionar_arquivo_video)
+        self.btn_arquivo.pack(side="left", padx=5, pady=12)
+
+        # Área Central Scrollable para conter o Grid de Vídeos
+        self.grid_scroll = ctkinter.CTkScrollableFrame(self, fg_color="transparent")
+        self.grid_scroll.pack(side="top", fill="both", expand=True, padx=10, pady=5)
+        
+        self.grid_scroll.grid_columnconfigure((0, 1, 2, 3), weight=1, pad=10)
+
+    def adicionar_arquivo_video(self):
+        caminho = filedialog.askopenfilename(filetypes=[("Vídeos", "*.mp4 *.avi *.mkv")])
+        if caminho:
+            nome_limpo = caminho.split('/')[-1]
+            self.criar_nova_instancia_stream(caminho, f"🎥 {nome_limpo}")
+
+    def abrir_janela_selecao_camera(self):
+        janela_cam = ctkinter.CTkToplevel(self)
+        janela_cam.title("Selecionar Câmera Disponível")
+        janela_cam.geometry("320x200")
+        janela_cam.resizable(False, False)
+        janela_cam.grab_set()
+
+        lbl = ctkinter.CTkLabel(janela_cam, text="Buscando dispositivos de vídeo...", font=("Arial", 12))
+        lbl.pack(pady=15)
+
+        lista_indices = listar_cameras_disponiveis()
+
+        if not lista_indices:
+            lbl.configure(text="Nenhuma câmera física encontrada!", text_color="#c62828")
+            btn_ok = ctkinter.CTkButton(janela_cam, text="Fechar", width=100, command=janela_cam.destroy)
+            btn_ok.pack(pady=10)
+            return
+
+        lbl.configure(text="Selecione a câmera desejada:")
+        
+        opcoes_texto = [f"Dispositivo de Vídeo {i}" for i in lista_indices]
+        combo_cams = ctkinter.CTkComboBox(janela_cam, values=opcoes_texto, width=200)
+        combo_cams.pack(pady=10)
+
+        def confirmar_selecao():
+            idx_selecionado = lista_indices[opcoes_texto.index(combo_cams.get())]
+            janela_cam.destroy()
+            self.criar_nova_instancia_stream(idx_selecionado, f"📷 Live Cam #{idx_selecionado}")
+
+        btn_conf = ctkinter.CTkButton(janela_cam, text="Conectar", fg_color="#2e7d32", hover_color="#1b5e20", command=confirmar_selecao)
+        btn_conf.pack(pady=15)
+
+    def criar_nova_instancia_stream(self, fonte, titulo):
+        nova_instancia = VideoInstanceFrame(self.grid_scroll, self, fonte, titulo)
+        self.instancias_ativas.append(nova_instancia)
+        self.redesenhar_grid_layouts()
+
+    def remover_instancia_grid(self, instancia):
+        if instancia in self.instancias_ativas:
+            self.instancias_ativas.remove(instancia)
+            instancia.destroy()
+            self.redesenhar_grid_layouts()
+
+    def redesenhar_grid_layouts(self):
+        for inst in self.instancias_ativas:
+            inst.grid_forget()
+
+        max_colunas = 3
+        for idx, inst in enumerate(self.instancias_ativas):
+            linha = idx // max_colunas
+            coluna = idx % max_colunas
+            inst.grid(row=linha, column=coluna, padx=10, pady=10, sticky="nsew")
+
+
 if __name__ == "__main__":
-    app = AppMedidor()
+    app = AppMedidorMultiplo()
     app.mainloop()
