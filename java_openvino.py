@@ -5,7 +5,6 @@ import math
 import time
 import threading
 import os
-import tkinter as tk
 from tkinter import filedialog, messagebox
 import customtkinter as ctkinter
 from PIL import Image
@@ -49,26 +48,46 @@ def listar_cameras_disponiveis():
 # =========================================================
 # GESTOR DE ENGINE DE INFERÊNCIA HÍBRIDO (CUDA / OPENVINO)
 # =========================================================
+import openvino as ov
+
+
 class HybridInferenceEngine:
     def __init__(self):
-        self.backend = "CPU"
+        self.backend = None
         self.core = ov.Core()
         self.core.set_property({'CACHE_DIR': './ov_cache_dir'})
 
-        try:
-            import onnxruntime as ort
-            if "CUDAExecutionProvider" in ort.get_available_providers():
-                self.backend = "CUDA"
-                self.ort = ort
-                print("[Engine] CUDA ativa via ONNX Runtime.")
-        except ImportError:
-            pass
+        # 1.ª Opção: Verifica se o OpenVINO tem uma GPU disponível (ex: Intel HD Graphics, Intel Arc)
+        if any("GPU" in dev for dev in self.core.available_devices):
+            self.backend = "OPENVINO_GPU"
+            print("[Engine] GPU Intel ativa via OpenVINO.")
 
-        if self.backend == "CPU":
-            if any("GPU" in dev for dev in self.core.available_devices):
-                self.backend = "OPENVINO_GPU"
-            else:
-                self.backend = "OPENVINO_CPU"
+        # Se não encontrou GPU via OpenVINO, tenta os provedores do ONNX Runtime
+        else:
+            try:
+                import onnxruntime as ort
+                provedores = ort.get_available_providers()
+
+                # 2.ª Opção: Verifica se tem GPU NVIDIA (CUDA)
+                if "CUDAExecutionProvider" in provedores:
+                    self.backend = "CUDA"
+                    self.ort = ort
+                    print("[Engine] CUDA ativa via ONNX Runtime.")
+
+                # 3.ª Opção: Verifica se tem GPU AMD ou outra compatível com DirectML (Windows)
+                elif "DmlExecutionProvider" in provedores:
+                    self.backend = "DIRECTML"
+                    self.ort = ort
+                    print("[Engine] GPU AMD/Genérica ativa via ONNX Runtime (DirectML).")
+
+            except ImportError:
+                pass
+
+        # 4.ª Opção: Se nenhuma GPU foi detetada acima, faz o Fallback para CPU via OpenVINO
+        if self.backend is None:
+            self.backend = "OPENVINO_CPU"
+            print("[Engine] Nenhuma GPU detetada. Usando CPU via OpenVINO.")
+
         print(f"--> [BACKEND GLOBAL SELECIONADO]: {self.backend}\n")
 
     def load_model(self, model_keys, target_forced_backend=None):
@@ -76,12 +95,15 @@ class HybridInferenceEngine:
         engine = HybridInferenceEngineInstance()
         engine.backend = backend_atual
 
-        if backend_atual == "CUDA":
+        # Configura a sessão ONNX para DirectML ou CUDA
+        if backend_atual in ["DIRECTML", "CUDA"]:
+            provedor = 'DmlExecutionProvider' if backend_atual == "DIRECTML" else 'CUDAExecutionProvider'
             engine.ort_session = self.ort.InferenceSession(
-                model_keys["onnx"], providers=['CUDAExecutionProvider', 'CPUExecutionProvider']
+                model_keys["onnx"], providers=[provedor, 'CPUExecutionProvider']
             )
             engine.input_name = engine.ort_session.get_inputs()[0].name
         else:
+            # Configura para OpenVINO (Seja GPU ou CPU)
             device = "GPU" if backend_atual == "OPENVINO_GPU" else "CPU"
             try:
                 model = self.core.read_model(model_keys["xml"])
@@ -103,13 +125,12 @@ class HybridInferenceEngineInstance:
         self.input_name = None
 
     def infer(self, tensor_input):
-        if self.backend == "CUDA":
+        if self.backend in ["CUDA", "DIRECTML"]:
             return self.ort_session.run(None, {self.input_name: tensor_input})[0]
         else:
             self.ov_infer_request.start_async([tensor_input])
             self.ov_infer_request.wait()
             return self.ov_infer_request.get_output_tensor().data
-
 
 def letterbox(im, new_shape=(640, 640), color=(114, 114, 114)):
     shape = im.shape[:2]
@@ -218,8 +239,7 @@ class VideoInstanceFrame(ctkinter.CTkFrame):
         ocr_no_zero_realizado = False
 
         p_superior_estatico = 0  
-        p_superior_cache = 0
-        p_inferior_cache = 0.0
+        p_superior_anterior = 0
         p_inferior_anterior = 0.0
 
         buffer_ocr_inp = np.zeros((1, 1, 32, 128), dtype=np.float32)
@@ -501,10 +521,19 @@ class VideoInstanceFrame(ctkinter.CTkFrame):
                 p_superior_cache = p_superior_estatico
 
             deve_processar_ocr = False
+            # Detecta se houve mudança de dígito no ponteiro superior comparado ao frame anterior
+            ponteiro_superior_mudou = (p_superior_cache != p_superior_anterior)
             if not ocr_inicial_realizado: deve_processar_ocr = True
-            elif p_superior_cache == 0 and p_inferior_cache == 0.0 and not ocr_no_zero_realizado: deve_processar_ocr = True
+            # Regra Dinâmica: Se o inferior completou a volta (saltou) OU o superior mudou de dígito
+            elif (completou_volta or ponteiro_superior_mudou) and not ocr_no_zero_realizado:
+                deve_processar_ocr = True
 
-            if p_superior_cache != 0 or p_inferior_cache != 0.0: ocr_no_zero_realizado = False
+            # Atualiza a memória do ponteiro superior para o próximo frame
+            p_superior_anterior = p_superior_cache
+
+            # Reset o travamento caso as condições de mudança deixem de ser verdadeiras
+            if not completou_volta and not ponteiro_superior_mudou:
+                ocr_no_zero_realizado = False
 
             if deve_processar_ocr and bbox_visor_estatico is not None:
                 x_v, y_v, ww_v, hh_v = bbox_visor_estatico
@@ -526,8 +555,10 @@ class VideoInstanceFrame(ctkinter.CTkFrame):
 
                     if texto_temp.strip() and texto_temp != "...":
                         texto_ocr_cache = texto_temp
-                        if not ocr_inicial_realizado: ocr_inicial_realizado = True
-                        elif p_superior_cache == 0 and p_inferior_cache == 0.0: ocr_no_zero_realizado = True
+                        if not ocr_inicial_realizado:
+                            ocr_inicial_realizado = True
+                        else:
+                            ocr_no_zero_realizado = True
 
             self.atualizar_ui_elementos(frame_estabilizado_rgb, texto_ocr_cache, p_superior_cache, p_inferior_cache)
 
