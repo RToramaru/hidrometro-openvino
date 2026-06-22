@@ -5,18 +5,37 @@ import math
 import time
 import threading
 import os
+import sys
 from tkinter import filedialog, messagebox
 import customtkinter as ctkinter
 from PIL import Image
 
 # =========================================================
-# CONFIGURAÇÕES GERAIS E CAMINHOS DOS MODELOS
+# LÓGICA DE DETECÇÃO DE CAMINHOS PARA EXECUTÁVEL ÚNICO (.ONEFILE)
 # =========================================================
+if getattr(sys, 'frozen', False):
+    # O PyInstaller salva o caminho da pasta temporária em sys._MEIPASS
+    DIRETORIO_BASE = getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
+    # O cache do OpenVINO vai para AppData/Local do utilizador logado
+    DIRETORIO_CACHE = os.path.join(os.environ.get('LOCALAPPDATA', os.path.expanduser('~')), 'ov_cache_dir')
+else:
+    # Se estiver a rodar como script Python normal
+    DIRETORIO_BASE = os.path.dirname(os.path.abspath(__file__))
+    DIRETORIO_CACHE = os.path.join(DIRETORIO_BASE, 'ov_cache_dir')
+
+# Garante que a pasta de cache do OpenVINO existe silenciosamente no sistema
+os.makedirs(DIRETORIO_CACHE, exist_ok=True)
+
+# Definição dinâmica do caminho dos modelos baseada no diretório de execução
+PATH_PESOS = os.path.join(DIRETORIO_BASE, "pesos")
+
 MODELOS = {
-    "visor": {"xml": "pesos/visor_openvino.xml", "onnx": "pesos/visor.onnx"},
-    "yolo": {"xml": "pesos/ponteiro_openvino.xml", "onnx": "pesos/ponteiro.onnx"},
-    "ocr": {"xml": "pesos/ocr_openvino.xml", "onnx": "pesos/ocr.onnx"},
-    "yolo_pose": {"xml": "pesos/posicao_openvino.xml", "onnx": "pesos/posicao.onnx"}
+    "visor": {"xml": os.path.join(PATH_PESOS, "visor_openvino.xml"), "onnx": os.path.join(PATH_PESOS, "visor.onnx")},
+    "yolo": {"xml": os.path.join(PATH_PESOS, "ponteiro_openvino.xml"),
+             "onnx": os.path.join(PATH_PESOS, "ponteiro.onnx")},
+    "ocr": {"xml": os.path.join(PATH_PESOS, "ocr_openvino.xml"), "onnx": os.path.join(PATH_PESOS, "ocr.onnx")},
+    "yolo_pose": {"xml": os.path.join(PATH_PESOS, "posicao_openvino.xml"),
+                  "onnx": os.path.join(PATH_PESOS, "posicao.onnx")}
 }
 
 SEG_SIZE = 512
@@ -48,16 +67,15 @@ def listar_cameras_disponiveis():
 # =========================================================
 # GESTOR DE ENGINE DE INFERÊNCIA HÍBRIDO (CUDA / OPENVINO)
 # =========================================================
-import openvino as ov
-
-
 class HybridInferenceEngine:
     def __init__(self):
         self.backend = None
         self.core = ov.Core()
-        self.core.set_property({'CACHE_DIR': './ov_cache_dir'})
 
-        # 1.ª Opção: Verifica se o OpenVINO tem uma GPU disponível (ex: Intel HD Graphics, Intel Arc)
+        # Define o local do Cache dinamicamente sem poluir a pasta da aplicação
+        self.core.set_property({'CACHE_DIR': DIRETORIO_CACHE})
+
+        # 1.ª Opção: Verifica se o OpenVINO tem uma GPU disponível (ex: Intel Graphics)
         if any("GPU" in dev for dev in self.core.available_devices):
             self.backend = "OPENVINO_GPU"
             print("[Engine] GPU Intel ativa via OpenVINO.")
@@ -132,12 +150,14 @@ class HybridInferenceEngineInstance:
             self.ov_infer_request.wait()
             return self.ov_infer_request.get_output_tensor().data
 
+
 def letterbox(im, new_shape=(640, 640), color=(114, 114, 114)):
     shape = im.shape[:2]
     r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
     new_unpad = (int(round(shape[1] * r)), int(round(shape[0] * r)))
     dw, dh = new_shape[1] - new_unpad[0], new_shape[0] - new_unpad[1]
-    dw /= 2; dh /= 2
+    dw /= 2;
+    dh /= 2
     if shape[::-1] != new_unpad:
         im = cv2.resize(im, new_unpad, interpolation=cv2.INTER_LINEAR)
     top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
@@ -155,47 +175,48 @@ class VideoInstanceFrame(ctkinter.CTkFrame):
         self.app_master = app_master
         self.video_source = video_source
 
-        # Estados da Instância
         self.running = True
         self.paused = False
         self.recording = False
         self.video_writer = None
 
-        # Componentes de UI internos
         self.top_info = ctkinter.CTkFrame(self, fg_color="transparent")
         self.top_info.pack(fill="x", padx=10, pady=(5, 2))
 
-        self.lbl_nome = ctkinter.CTkLabel(self.top_info, text=titulo_nome, font=("Arial", 11, "bold"), text_color="#ffffff", anchor="w")
+        self.lbl_nome = ctkinter.CTkLabel(self.top_info, text=titulo_nome, font=("Arial", 11, "bold"),
+                                          text_color="#ffffff", anchor="w")
         self.lbl_nome.pack(side="left", fill="x", expand=True)
 
-        self.btn_fechar = ctkinter.CTkButton(self.top_info, text="✕ Close", width=55, height=20, fg_color="#c62828", hover_color="#b71c1c", font=("Arial", 10, "bold"), command=self.fechar_instancia)
+        self.btn_fechar = ctkinter.CTkButton(self.top_info, text="✕ Close", width=55, height=20, fg_color="#c62828",
+                                             hover_color="#b71c1c", font=("Arial", 10, "bold"),
+                                             command=self.fechar_instancia)
         self.btn_fechar.pack(side="right")
 
-        # Viewport da Câmera (Usa CTkLabel)
         self.video_canvas = ctkinter.CTkLabel(self, text="", fg_color="#000000", width=280, height=240)
         self.video_canvas.pack(padx=10, pady=2)
 
-        # Telemetria dedicada
         self.telemetria_frame = ctkinter.CTkFrame(self, fg_color="#182515", border_color="#2a4025", border_width=1)
         self.telemetria_frame.pack(fill="x", padx=10, pady=4)
 
-        self.lbl_ocr = ctkinter.CTkLabel(self.telemetria_frame, text="OCR: ...", font=("Consolas", 12, "bold"), text_color="#00ff00", anchor="w")
+        self.lbl_ocr = ctkinter.CTkLabel(self.telemetria_frame, text="OCR: ...", font=("Consolas", 12, "bold"),
+                                         text_color="#00ff00", anchor="w")
         self.lbl_ocr.pack(fill="x", padx=10, pady=(4, 1))
 
-        self.lbl_ponteiros = ctkinter.CTkLabel(self.telemetria_frame, text="Ponteiros: ...", font=("Consolas", 12, "bold"), text_color="#00ff00", anchor="w")
+        self.lbl_ponteiros = ctkinter.CTkLabel(self.telemetria_frame, text="Ponteiros: ...",
+                                               font=("Consolas", 12, "bold"), text_color="#00ff00", anchor="w")
         self.lbl_ponteiros.pack(fill="x", padx=10, pady=(1, 4))
 
-        # Controles locais
         self.control_bar = ctkinter.CTkFrame(self, fg_color="transparent")
         self.control_bar.pack(fill="x", padx=10, pady=(2, 8))
 
-        self.btn_pausa = ctkinter.CTkButton(self.control_bar, text="⏸ Pausar", width=80, height=25, fg_color="#4a4a4a", hover_color="#5a5a5a", font=("Arial", 11), command=self.alternar_pausa)
+        self.btn_pausa = ctkinter.CTkButton(self.control_bar, text="⏸ Pausar", width=80, height=25, fg_color="#4a4a4a",
+                                            hover_color="#5a5a5a", font=("Arial", 11), command=self.alternar_pausa)
         self.btn_pausa.pack(side="left", padx=(0, 5))
 
-        self.btn_gravar = ctkinter.CTkButton(self.control_bar, text="🟠 Gravar", width=80, height=25, fg_color="#e64a19", hover_color="#bf360c", font=("Arial", 11), command=self.alternar_gravacao)
+        self.btn_gravar = ctkinter.CTkButton(self.control_bar, text="🟠 Gravar", width=80, height=25, fg_color="#e64a19",
+                                             hover_color="#bf360c", font=("Arial", 11), command=self.alternar_gravacao)
         self.btn_gravar.pack(side="left", padx=5)
 
-        # Dispara thread de processamento desta instância
         self.thread = threading.Thread(target=self.loop_pipeline, daemon=True)
         self.thread.start()
 
@@ -206,7 +227,8 @@ class VideoInstanceFrame(ctkinter.CTkFrame):
     def alternar_gravacao(self):
         if not self.recording:
             timestamp = time.strftime("%Y%m%d-%H%M%S")
-            filename = f"gravacao_{timestamp}_{np.random.randint(100,999)}.mp4"
+            # Salva gravações no diretório base atual do programa
+            filename = os.path.join(DIRETORIO_BASE, f"gravacao_{timestamp}_{np.random.randint(100, 999)}.mp4")
             self.output_filename = filename
             self.recording = True
             self.btn_gravar.configure(text="🔴 Parar", fg_color="#b71c1c", hover_color="#7f0000")
@@ -216,7 +238,7 @@ class VideoInstanceFrame(ctkinter.CTkFrame):
             if self.video_writer:
                 self.video_writer.release()
                 self.video_writer = None
-                messagebox.showinfo("Gravação Concluída", f"Vídeo salvo com sucesso como:\n{self.output_filename}")
+                messagebox.showinfo("Gravação Concluída", f"Vídeo salvo com sucesso em:\n{self.output_filename}")
 
     def fechar_instancia(self):
         self.running = False
@@ -226,7 +248,7 @@ class VideoInstanceFrame(ctkinter.CTkFrame):
 
     def loop_pipeline(self):
         cap = cv2.VideoCapture(self.video_source)
-        
+
         calibrado = False
         rotation_step = None
         bbox_visor_estatico = None
@@ -238,7 +260,7 @@ class VideoInstanceFrame(ctkinter.CTkFrame):
         ocr_inicial_realizado = False
         ocr_no_zero_realizado = False
 
-        p_superior_estatico = 0  
+        p_superior_estatico = 0
         p_superior_anterior = 0
         p_inferior_anterior = 0.0
 
@@ -258,15 +280,16 @@ class VideoInstanceFrame(ctkinter.CTkFrame):
                     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
                     fps = cap.get(cv2.CAP_PROP_FPS)
                     if fps <= 0 or math.isnan(fps): fps = 30.0
-                    self.video_writer = cv2.VideoWriter(self.output_filename, fourcc, fps, (frame.shape[1], frame.shape[0]))
+                    self.video_writer = cv2.VideoWriter(self.output_filename, fourcc, fps,
+                                                        (frame.shape[1], frame.shape[0]))
                 self.video_writer.write(frame)
 
             h_orig, w_orig = frame.shape[:2]
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-            # --- ETAPA DE CALIBRAÇÃO ---
             if not calibrado:
-                seg_inp = cv2.resize(frame_rgb, (SEG_SIZE, SEG_SIZE)).transpose(2, 0, 1)[None, ...].astype(np.float32, copy=False) / 255.0
+                seg_inp = cv2.resize(frame_rgb, (SEG_SIZE, SEG_SIZE)).transpose(2, 0, 1)[None, ...].astype(np.float32,
+                                                                                                           copy=False) / 255.0
                 seg_inp = np.ascontiguousarray(seg_inp)
 
                 pred_seg = self.app_master.model_visor.infer(seg_inp)
@@ -327,8 +350,10 @@ class VideoInstanceFrame(ctkinter.CTkFrame):
                 if l_rect < a_rect:
                     angulo = angulo - 90 if angulo > 0 else angulo + 90
                 else:
-                    if angulo > 45: angulo -= 90
-                    elif angulo < -45: angulo += 90
+                    if angulo > 45:
+                        angulo -= 90
+                    elif angulo < -45:
+                        angulo += 90
 
                 if abs(angulo) > 0.1:
                     M_rot = cv2.getRotationMatrix2D((cx_c, cy_c), angulo, 1.0)
@@ -369,7 +394,8 @@ class VideoInstanceFrame(ctkinter.CTkFrame):
                 frame_piloto_est_rgb = cv2.remap(frame_calib_rgb, map_x, map_y, cv2.INTER_LINEAR)
                 h_est, w_est = frame_piloto_est_rgb.shape[:2]
 
-                seg_inp_est = cv2.resize(frame_piloto_est_rgb, (SEG_SIZE, SEG_SIZE)).transpose(2, 0, 1)[None, ...].astype(np.float32, copy=False) / 255.0
+                seg_inp_est = cv2.resize(frame_piloto_est_rgb, (SEG_SIZE, SEG_SIZE)).transpose(2, 0, 1)[
+                                  None, ...].astype(np.float32, copy=False) / 255.0
                 seg_inp_est = np.ascontiguousarray(seg_inp_est)
 
                 pred_seg_est = self.app_master.model_visor.infer(seg_inp_est)
@@ -379,7 +405,8 @@ class VideoInstanceFrame(ctkinter.CTkFrame):
                 if len(contours_est) > 0:
                     bbox_visor_estatico = cv2.boundingRect(max(contours_est, key=cv2.contourArea))
 
-                inp_img_est, ratio_est, dw_est, dh_est = letterbox(frame_piloto_est_rgb, new_shape=(YOLO_SIZE, YOLO_SIZE))
+                inp_img_est, ratio_est, dw_est, dh_est = letterbox(frame_piloto_est_rgb,
+                                                                   new_shape=(YOLO_SIZE, YOLO_SIZE))
                 yolo_inp_est = inp_img_est.transpose(2, 0, 1)[None, ...].astype(np.float32, copy=False) / 255.0
                 yolo_inp_est = np.ascontiguousarray(yolo_inp_est)
                 saida_bruta_yolo_est = self.app_master.model_yolo.infer(yolo_inp_est)
@@ -399,7 +426,8 @@ class VideoInstanceFrame(ctkinter.CTkFrame):
 
                 for ponteiro in caixas_ponteiros_estaticas:
                     x1, y1, x2, y2 = ponteiro
-                    w_p_crop = x2 - x1; h_p_crop = y2 - y1
+                    w_p_crop = x2 - x1;
+                    h_p_crop = y2 - y1
                     r_p = min(YOLO_POSE_SIZE / h_p_crop, YOLO_POSE_SIZE / w_p_crop)
                     new_unpad_w, new_unpad_h = int(round(w_p_crop * r_p)), int(round(h_p_crop * r_p))
                     dw_p = (YOLO_POSE_SIZE - new_unpad_w) / 2
@@ -413,21 +441,26 @@ class VideoInstanceFrame(ctkinter.CTkFrame):
                         r_p, dw_p, dh_p, _, _ = params_letterbox_ponteiros[0]
                         top, left = int(round(dh_p - 0.1)), int(round(dw_p - 0.1))
                         crop_padded = np.full((YOLO_POSE_SIZE, YOLO_POSE_SIZE, 3), 114, dtype=np.uint8)
-                        crop_resized = cv2.resize(crop_p_rgb, (crop_padded.shape[1] - left * 2, crop_padded.shape[0] - top * 2), interpolation=cv2.INTER_LINEAR)
+                        crop_resized = cv2.resize(crop_p_rgb,
+                                                  (crop_padded.shape[1] - left * 2, crop_padded.shape[0] - top * 2),
+                                                  interpolation=cv2.INTER_LINEAR)
                         crop_padded[top:top + crop_resized.shape[0], left:left + crop_resized.shape[1]] = crop_resized
-                        
+
                         tensor_single = crop_padded.transpose(2, 0, 1)[None, ...].astype(np.float32, copy=False) / 255.0
                         preds_pose_single = self.app_master.model_pose.infer(tensor_single)
-                        
+
                         single_pred = np.squeeze(preds_pose_single)
                         if len(single_pred.shape) == 1: single_pred = np.expand_dims(single_pred, axis=0)
-                        preds_pose = np.transpose(single_pred) if single_pred.shape[0] < single_pred.shape[1] else single_pred
-                        
+                        preds_pose = np.transpose(single_pred) if single_pred.shape[0] < single_pred.shape[
+                            1] else single_pred
+
                         if preds_pose.shape[0] > 0 and np.max(preds_pose[:, 4]) >= CONF_THRESHOLD_POSE:
                             melhor_pred = preds_pose[np.argmax(preds_pose[:, 4])]
                             kpts = melhor_pred[5:]
                             if len(kpts) >= 6 and kpts[2] > 0.35 and kpts[5] > 0.35:
-                                angulo = math.degrees(math.atan2((kpts[4] - dh_p) / r_p - (kpts[1] - dh_p) / r_p, (kpts[3] - dw_p) / r_p - (kpts[0] - dw_p) / r_p)) + 90.0
+                                angulo = math.degrees(math.atan2((kpts[4] - dh_p) / r_p - (kpts[1] - dh_p) / r_p,
+                                                                 (kpts[3] - dw_p) / r_p - (
+                                                                             kpts[0] - dw_p) / r_p)) + 90.0
                                 if angulo < 0: angulo += 360.0
                                 val = round((angulo % 360.0) / 36.0, 1)
                                 if val >= 10.0: val = 0.0
@@ -435,7 +468,6 @@ class VideoInstanceFrame(ctkinter.CTkFrame):
 
                 calibrado = True
 
-            # --- PROCESSAMENTO EM TEMPO REAL ---
             if rotation_step is not None:
                 frame_rgb = cv2.rotate(frame_rgb, rotation_step)
 
@@ -448,7 +480,9 @@ class VideoInstanceFrame(ctkinter.CTkFrame):
                     r_p, dw_p, dh_p, _, _ = params_letterbox_ponteiros[1]
                     top, left = int(round(dh_p - 0.1)), int(round(dw_p - 0.1))
                     crop_padded = np.full((YOLO_POSE_SIZE, YOLO_POSE_SIZE, 3), 114, dtype=np.uint8)
-                    crop_resized = cv2.resize(crop_p_rgb, (crop_padded.shape[1] - left * 2, crop_padded.shape[0] - top * 2), interpolation=cv2.INTER_LINEAR)
+                    crop_resized = cv2.resize(crop_p_rgb,
+                                              (crop_padded.shape[1] - left * 2, crop_padded.shape[0] - top * 2),
+                                              interpolation=cv2.INTER_LINEAR)
                     crop_padded[top:top + crop_resized.shape[0], left:left + crop_resized.shape[1]] = crop_resized
 
                     tensor_inf = crop_padded.transpose(2, 0, 1)[None, ...].astype(np.float32, copy=False) / 255.0
@@ -456,7 +490,8 @@ class VideoInstanceFrame(ctkinter.CTkFrame):
 
                     single_pred = np.squeeze(preds_pose_inf)
                     if len(single_pred.shape) == 1: single_pred = np.expand_dims(single_pred, axis=0)
-                    preds_pose = np.transpose(single_pred) if single_pred.shape[0] < single_pred.shape[1] else single_pred
+                    preds_pose = np.transpose(single_pred) if single_pred.shape[0] < single_pred.shape[
+                        1] else single_pred
 
                     melhor_pred = None
                     if preds_pose.shape[0] > 0 and np.max(preds_pose[:, 4]) >= CONF_THRESHOLD_POSE:
@@ -465,7 +500,9 @@ class VideoInstanceFrame(ctkinter.CTkFrame):
                     if melhor_pred is not None:
                         kpts = melhor_pred[5:]
                         if len(kpts) >= 6 and kpts[2] > 0.35 and kpts[5] > 0.35:
-                            angulo_ajustated = math.degrees(math.atan2((kpts[4] - dh_p) / r_p - (kpts[1] - dh_p) / r_p, (kpts[3] - dw_p) / r_p - (kpts[0] - dw_p) / r_p)) + 90.0
+                            angulo_ajustated = math.degrees(math.atan2((kpts[4] - dh_p) / r_p - (kpts[1] - dh_p) / r_p,
+                                                                       (kpts[3] - dw_p) / r_p - (
+                                                                                   kpts[0] - dw_p) / r_p)) + 90.0
                             if angulo_ajustated < 0: angulo_ajustated += 360.0
                             valor_original = round((angulo_ajustated % 360.0) / 36.0, 1)
                             if valor_original >= 10.0: valor_original = 0.0
@@ -475,10 +512,14 @@ class VideoInstanceFrame(ctkinter.CTkFrame):
                                 valor_original = round(valor_original - 0.1, 1)
                                 if valor_original < 0.0: valor_original = 0.0
                             p_inferior_cache = valor_original
-                        else: p_inferior_cache = 0.0
-                    else: p_inferior_cache = 0.0
-                else: p_inferior_cache = 0.0
-            else: p_inferior_cache = 0.0
+                        else:
+                            p_inferior_cache = 0.0
+                    else:
+                        p_inferior_cache = 0.0
+                else:
+                    p_inferior_cache = 0.0
+            else:
+                p_inferior_cache = 0.0
 
             completou_volta = (p_inferior_cache == 0.0) or (p_inferior_anterior > 5.0 and p_inferior_cache < 1.0)
             p_inferior_anterior = p_inferior_cache
@@ -490,7 +531,9 @@ class VideoInstanceFrame(ctkinter.CTkFrame):
                     r_p, dw_p, dh_p, _, _ = params_letterbox_ponteiros[0]
                     top, left = int(round(dh_p - 0.1)), int(round(dw_p - 0.1))
                     crop_padded = np.full((YOLO_POSE_SIZE, YOLO_POSE_SIZE, 3), 114, dtype=np.uint8)
-                    crop_resized = cv2.resize(crop_p_rgb, (crop_padded.shape[1] - left * 2, crop_padded.shape[0] - top * 2), interpolation=cv2.INTER_LINEAR)
+                    crop_resized = cv2.resize(crop_p_rgb,
+                                              (crop_padded.shape[1] - left * 2, crop_padded.shape[0] - top * 2),
+                                              interpolation=cv2.INTER_LINEAR)
                     crop_padded[top:top + crop_resized.shape[0], left:left + crop_resized.shape[1]] = crop_resized
 
                     tensor_sup = crop_padded.transpose(2, 0, 1)[None, ...].astype(np.float32, copy=False) / 255.0
@@ -498,7 +541,8 @@ class VideoInstanceFrame(ctkinter.CTkFrame):
 
                     single_pred = np.squeeze(preds_pose_sup)
                     if len(single_pred.shape) == 1: single_pred = np.expand_dims(single_pred, axis=0)
-                    preds_pose = np.transpose(single_pred) if single_pred.shape[0] < single_pred.shape[1] else single_pred
+                    preds_pose = np.transpose(single_pred) if single_pred.shape[0] < single_pred.shape[
+                        1] else single_pred
 
                     melhor_pred = None
                     if preds_pose.shape[0] > 0 and np.max(preds_pose[:, 4]) >= CONF_THRESHOLD_POSE:
@@ -507,31 +551,33 @@ class VideoInstanceFrame(ctkinter.CTkFrame):
                     if melhor_pred is not None:
                         kpts = melhor_pred[5:]
                         if len(kpts) >= 6 and kpts[2] > 0.35 and kpts[5] > 0.35:
-                            angulo_ajustated = math.degrees(math.atan2((kpts[4] - dh_p) / r_p - (kpts[1] - dh_p) / r_p, (kpts[3] - dw_p) / r_p - (kpts[0] - dw_p) / r_p)) + 90.0
+                            angulo_ajustated = math.degrees(math.atan2((kpts[4] - dh_p) / r_p - (kpts[1] - dh_p) / r_p,
+                                                                       (kpts[3] - dw_p) / r_p - (
+                                                                                   kpts[0] - dw_p) / r_p)) + 90.0
                             if angulo_ajustated < 0: angulo_ajustated += 360.0
                             valor_original = round((angulo_ajustated % 360.0) / 36.0, 1)
                             if valor_original >= 10.0: valor_original = 0.0
 
                             p_superior_estatico = int(round(valor_original))
                             p_superior_cache = p_superior_estatico
-                        else: p_superior_cache = p_superior_estatico
-                    else: p_superior_cache = p_superior_estatico
-                else: p_superior_cache = p_superior_estatico
+                        else:
+                            p_superior_cache = p_superior_estatico
+                    else:
+                        p_superior_cache = p_superior_estatico
+                else:
+                    p_superior_cache = p_superior_estatico
             else:
                 p_superior_cache = p_superior_estatico
 
             deve_processar_ocr = False
-            # Detecta se houve mudança de dígito no ponteiro superior comparado ao frame anterior
             ponteiro_superior_mudou = (p_superior_cache != p_superior_anterior)
-            if not ocr_inicial_realizado: deve_processar_ocr = True
-            # Regra Dinâmica: Se o inferior completou a volta (saltou) OU o superior mudou de dígito
+            if not ocr_inicial_realizado:
+                deve_processar_ocr = True
             elif (completou_volta or ponteiro_superior_mudou) and not ocr_no_zero_realizado:
                 deve_processar_ocr = True
 
-            # Atualiza a memória do ponteiro superior para o próximo frame
             p_superior_anterior = p_superior_cache
 
-            # Reset o travamento caso as condições de mudança deixem de ser verdadeiras
             if not completou_volta and not ponteiro_superior_mudou:
                 ocr_no_zero_realizado = False
 
@@ -567,15 +613,14 @@ class VideoInstanceFrame(ctkinter.CTkFrame):
     def atualizar_ui_elementos(self, frame_rgb, ocr, p_sup, p_inf):
         frame_resized = cv2.resize(frame_rgb, (280, 240), interpolation=cv2.INTER_AREA)
         img_pil = Image.fromarray(frame_resized)
-        
-        # Corrigido para CTkImage para evitar o Warning de HighDPI do CustomTkinter
+
         img_ctk = ctkinter.CTkImage(light_image=img_pil, dark_image=img_pil, size=(280, 240))
         self.after(0, self._set_labels_and_image, img_ctk, ocr, p_sup, p_inf)
 
     def _set_labels_and_image(self, img_ctk, ocr, p_sup, p_inf):
         if not self.running: return
         self.video_canvas.configure(image=img_ctk)
-        self.video_canvas.image = img_ctk  
+        self.video_canvas.image = img_ctk
         self.lbl_ocr.configure(text=f"OCR: {ocr}")
         self.lbl_ponteiros.configure(text=f"Ponteiros: {p_sup} | {p_inf:.1f}")
 
@@ -591,10 +636,8 @@ class AppMedidorMultiplo(ctkinter.CTk):
         self.geometry("1280x760")
         self.configure(fg_color="#1e1e1e")
 
-        # Corrigido aqui: Inicializa corretamente a variável usada na gerência do grid
         self.instancias_ativas = []
 
-        # Instancia as Engines uma única vez para economizar memória global
         self.master_engine = HybridInferenceEngine()
         print("A carregar pipeline de modelos compartilhados...")
         self.model_visor = self.master_engine.load_model(MODELOS["visor"])
@@ -605,20 +648,22 @@ class AppMedidorMultiplo(ctkinter.CTk):
         self.construir_interface_principal()
 
     def construir_interface_principal(self):
-        # Top Menu Bar
         self.top_bar = ctkinter.CTkFrame(self, height=60, fg_color="#2b2b2b", corner_radius=0)
         self.top_bar.pack(side="top", fill="x", padx=10, pady=10)
 
-        self.btn_camera = ctkinter.CTkButton(self.top_bar, text="📷 Câmera Local", font=("Arial", 13, "bold"), fg_color="#007acc", hover_color="#005999", command=self.abrir_janela_selecao_camera)
+        self.btn_camera = ctkinter.CTkButton(self.top_bar, text="📷 Câmera Local", font=("Arial", 13, "bold"),
+                                             fg_color="#007acc", hover_color="#005999",
+                                             command=self.abrir_janela_selecao_camera)
         self.btn_camera.pack(side="left", padx=15, pady=12)
 
-        self.btn_arquivo = ctkinter.CTkButton(self.top_bar, text="📁 Adicionar Vídeo", font=("Arial", 13, "bold"), fg_color="#007acc", hover_color="#005999", command=self.adicionar_arquivo_video)
+        self.btn_arquivo = ctkinter.CTkButton(self.top_bar, text="📁 Adicionar Vídeo", font=("Arial", 13, "bold"),
+                                              fg_color="#007acc", hover_color="#005999",
+                                              command=self.adicionar_arquivo_video)
         self.btn_arquivo.pack(side="left", padx=5, pady=12)
 
-        # Área Central Scrollable para conter o Grid de Vídeos
         self.grid_scroll = ctkinter.CTkScrollableFrame(self, fg_color="transparent")
         self.grid_scroll.pack(side="top", fill="both", expand=True, padx=10, pady=5)
-        
+
         self.grid_scroll.grid_columnconfigure((0, 1, 2, 3), weight=1, pad=10)
 
     def adicionar_arquivo_video(self):
@@ -646,7 +691,7 @@ class AppMedidorMultiplo(ctkinter.CTk):
             return
 
         lbl.configure(text="Selecione a câmera desejada:")
-        
+
         opcoes_texto = [f"Dispositivo de Vídeo {i}" for i in lista_indices]
         combo_cams = ctkinter.CTkComboBox(janela_cam, values=opcoes_texto, width=200)
         combo_cams.pack(pady=10)
@@ -656,7 +701,8 @@ class AppMedidorMultiplo(ctkinter.CTk):
             janela_cam.destroy()
             self.criar_nova_instancia_stream(idx_selecionado, f"📷 Live Cam #{idx_selecionado}")
 
-        btn_conf = ctkinter.CTkButton(janela_cam, text="Conectar", fg_color="#2e7d32", hover_color="#1b5e20", command=confirmar_selecao)
+        btn_conf = ctkinter.CTkButton(janela_cam, text="Conectar", fg_color="#2e7d32", hover_color="#1b5e20",
+                                      command=confirmar_selecao)
         btn_conf.pack(pady=15)
 
     def criar_nova_instancia_stream(self, fonte, titulo):
