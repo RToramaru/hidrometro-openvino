@@ -636,6 +636,13 @@ class AppMedidorMultiplo(ctkinter.CTk):
         self.geometry("1280x760")
         self.configure(fg_color="#1e1e1e")
 
+        # === ADICIONE ESTA LINHA PARA O ÍCONE DA JANELA ===
+        # Procura o ícone na pasta 'imagens' dentro do diretório base configurado no topo do seu script
+        caminho_icone = os.path.join(DIRETORIO_BASE, "imagens", "icone.ico")
+        if os.path.exists(caminho_icone):
+            self.iconbitmap(caminho_icone)
+        # =================================================
+
         self.instancias_ativas = []
 
         self.master_engine = HybridInferenceEngine()
