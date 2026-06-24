@@ -6,6 +6,7 @@ import time
 import threading
 import os
 import sys
+import subprocess
 from tkinter import filedialog, messagebox
 import customtkinter as ctkinter
 from PIL import Image
@@ -14,19 +15,14 @@ from PIL import Image
 # LÓGICA DE DETECÇÃO DE CAMINHOS PARA EXECUTÁVEL ÚNICO (.ONEFILE)
 # =========================================================
 if getattr(sys, 'frozen', False):
-    # O PyInstaller salva o caminho da pasta temporária em sys._MEIPASS
     DIRETORIO_BASE = getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
-    # O cache do OpenVINO vai para AppData/Local do utilizador logado
     DIRETORIO_CACHE = os.path.join(os.environ.get('LOCALAPPDATA', os.path.expanduser('~')), 'ov_cache_dir')
 else:
-    # Se estiver a rodar como script Python normal
     DIRETORIO_BASE = os.path.dirname(os.path.abspath(__file__))
     DIRETORIO_CACHE = os.path.join(DIRETORIO_BASE, 'ov_cache_dir')
 
-# Garante que a pasta de cache do OpenVINO existe silenciosamente no sistema
 os.makedirs(DIRETORIO_CACHE, exist_ok=True)
 
-# Definição dinâmica do caminho dos modelos baseada no diretório de execução
 PATH_PESOS = os.path.join(DIRETORIO_BASE, "pesos")
 
 MODELOS = {
@@ -51,9 +47,14 @@ ctkinter.set_appearance_mode("Dark")
 ctkinter.set_default_color_theme("blue")
 
 
-# =========================================================
-# FUNÇÃO AUXILIAR PARA DETECTAR CÂMERAS DISPONÍVEIS
-# =========================================================
+def abrir_configuracoes_camera_windows():
+    """Abre a janela nativa de configurações de privacidade de câmera do Windows."""
+    try:
+        subprocess.Popen("start ms-settings:privacy-webcam", shell=True)
+    except Exception as e:
+        print(f"[Erro] Falha ao abrir configurações do Windows: {e}")
+
+
 def listar_cameras_disponiveis():
     cameras = []
     for i in range(5):
@@ -71,37 +72,26 @@ class HybridInferenceEngine:
     def __init__(self):
         self.backend = None
         self.core = ov.Core()
-
-        # Define o local do Cache dinamicamente sem poluir a pasta da aplicação
         self.core.set_property({'CACHE_DIR': DIRETORIO_CACHE})
 
-        # 1.ª Opção: Verifica se o OpenVINO tem uma GPU disponível (ex: Intel Graphics)
         if any("GPU" in dev for dev in self.core.available_devices):
             self.backend = "OPENVINO_GPU"
             print("[Engine] GPU Intel ativa via OpenVINO.")
-
-        # Se não encontrou GPU via OpenVINO, tenta os provedores do ONNX Runtime
         else:
             try:
                 import onnxruntime as ort
                 provedores = ort.get_available_providers()
-
-                # 2.ª Opção: Verifica se tem GPU NVIDIA (CUDA)
                 if "CUDAExecutionProvider" in provedores:
                     self.backend = "CUDA"
                     self.ort = ort
                     print("[Engine] CUDA ativa via ONNX Runtime.")
-
-                # 3.ª Opção: Verifica se tem GPU AMD ou outra compatível com DirectML (Windows)
                 elif "DmlExecutionProvider" in provedores:
                     self.backend = "DIRECTML"
                     self.ort = ort
                     print("[Engine] GPU AMD/Genérica ativa via ONNX Runtime (DirectML).")
-
             except ImportError:
                 pass
 
-        # 4.ª Opção: Se nenhuma GPU foi detetada acima, faz o Fallback para CPU via OpenVINO
         if self.backend is None:
             self.backend = "OPENVINO_CPU"
             print("[Engine] Nenhuma GPU detetada. Usando CPU via OpenVINO.")
@@ -113,7 +103,6 @@ class HybridInferenceEngine:
         engine = HybridInferenceEngineInstance()
         engine.backend = backend_atual
 
-        # Configura a sessão ONNX para DirectML ou CUDA
         if backend_atual in ["DIRECTML", "CUDA"]:
             provedor = 'DmlExecutionProvider' if backend_atual == "DIRECTML" else 'CUDAExecutionProvider'
             engine.ort_session = self.ort.InferenceSession(
@@ -121,7 +110,6 @@ class HybridInferenceEngine:
             )
             engine.input_name = engine.ort_session.get_inputs()[0].name
         else:
-            # Configura para OpenVINO (Seja GPU ou CPU)
             device = "GPU" if backend_atual == "OPENVINO_GPU" else "CPU"
             try:
                 model = self.core.read_model(model_keys["xml"])
@@ -174,11 +162,16 @@ class VideoInstanceFrame(ctkinter.CTkFrame):
         super().__init__(master, fg_color="#2b2b2b", border_color="#3a3a3a", border_width=1)
         self.app_master = app_master
         self.video_source = video_source
+        self.is_hardware_camera = isinstance(video_source, int)
 
         self.running = True
         self.paused = False
         self.recording = False
         self.video_writer = None
+
+        # Controle de calibração por evento/botão
+        self.solicitou_calibracao = False
+        self.calibrado = False
 
         self.top_info = ctkinter.CTkFrame(self, fg_color="transparent")
         self.top_info.pack(fill="x", padx=10, pady=(5, 2))
@@ -187,7 +180,7 @@ class VideoInstanceFrame(ctkinter.CTkFrame):
                                           text_color="#ffffff", anchor="w")
         self.lbl_nome.pack(side="left", fill="x", expand=True)
 
-        self.btn_fechar = ctkinter.CTkButton(self.top_info, text="✕ Close", width=55, height=20, fg_color="#c62828",
+        self.btn_fechar = ctkinter.CTkButton(self.top_info, text="✕ Fechar", width=55, height=20, fg_color="#c62828",
                                              hover_color="#b71c1c", font=("Arial", 10, "bold"),
                                              command=self.fechar_instancia)
         self.btn_fechar.pack(side="right")
@@ -209,13 +202,21 @@ class VideoInstanceFrame(ctkinter.CTkFrame):
         self.control_bar = ctkinter.CTkFrame(self, fg_color="transparent")
         self.control_bar.pack(fill="x", padx=10, pady=(2, 8))
 
-        self.btn_pausa = ctkinter.CTkButton(self.control_bar, text="⏸ Pausar", width=80, height=25, fg_color="#4a4a4a",
+        self.btn_pausa = ctkinter.CTkButton(self.control_bar, text="⏸ Pausar", width=70, height=25, fg_color="#4a4a4a",
                                             hover_color="#5a5a5a", font=("Arial", 11), command=self.alternar_pausa)
-        self.btn_pausa.pack(side="left", padx=(0, 5))
+        self.btn_pausa.pack(side="left", padx=(0, 2))
 
-        self.btn_gravar = ctkinter.CTkButton(self.control_bar, text="🟠 Gravar", width=80, height=25, fg_color="#e64a19",
+        self.btn_gravar = ctkinter.CTkButton(self.control_bar, text="🟠 Gravar", width=70, height=25, fg_color="#e64a19",
                                              hover_color="#bf360c", font=("Arial", 11), command=self.alternar_gravacao)
-        self.btn_gravar.pack(side="left", padx=5)
+        self.btn_gravar.pack(side="left", padx=2)
+
+        # Adiciona o botão de calibração se for uma Câmera Física
+        if self.is_hardware_camera:
+            self.btn_calibrar = ctkinter.CTkButton(self.control_bar, text="🛠 Calibrar", width=70, height=25,
+                                                   fg_color="#2e7d32",
+                                                   hover_color="#1b5e20", font=("Arial", 11, "bold"),
+                                                   command=self.solicitar_calibracao)
+            self.btn_calibrar.pack(side="left", padx=2)
 
         self.thread = threading.Thread(target=self.loop_pipeline, daemon=True)
         self.thread.start()
@@ -227,7 +228,6 @@ class VideoInstanceFrame(ctkinter.CTkFrame):
     def alternar_gravacao(self):
         if not self.recording:
             timestamp = time.strftime("%Y%m%d-%H%M%S")
-            # Salva gravações no diretório base atual do programa
             filename = os.path.join(DIRETORIO_BASE, f"gravacao_{timestamp}_{np.random.randint(100, 999)}.mp4")
             self.output_filename = filename
             self.recording = True
@@ -240,6 +240,9 @@ class VideoInstanceFrame(ctkinter.CTkFrame):
                 self.video_writer = None
                 messagebox.showinfo("Gravação Concluída", f"Vídeo salvo com sucesso em:\n{self.output_filename}")
 
+    def solicitar_calibracao(self):
+        self.solicitou_calibracao = True
+
     def fechar_instancia(self):
         self.running = False
         if self.video_writer:
@@ -247,9 +250,21 @@ class VideoInstanceFrame(ctkinter.CTkFrame):
         self.app_master.remover_instancia_grid(self)
 
     def loop_pipeline(self):
-        cap = cv2.VideoCapture(self.video_source)
+        # RESPOSTA QUESTÃO 1: Abre usando CAP_DSHOW se for Windows para evitar frames nulos
+        if self.is_hardware_camera and os.name == 'nt':
+            cap = cv2.VideoCapture(self.video_source, cv2.CAP_DSHOW)
+        else:
+            cap = cv2.VideoCapture(self.video_source)
 
-        calibrado = False
+        # RESPOSTA QUESTÃO 4: Força resolução estável padrão para compatibilidade
+        if self.is_hardware_camera:
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+        # RESPOSTA QUESTÃO 3: Detecção inteligente de travamentos de privacidade/hardware
+        tentativas_vazias = 0
+        max_tentativas = 30
+
         rotation_step = None
         bbox_visor_estatico = None
         caixas_ponteiros_estaticas = []
@@ -272,8 +287,25 @@ class VideoInstanceFrame(ctkinter.CTkFrame):
                 continue
 
             ret, frame = cap.read()
-            if not ret:
-                break
+
+            # Validação inteligente se o dispositivo falhar em entregar frames
+            if not ret or frame is None:
+                tentativas_vazias += 1
+                if tentativas_vazias > max_tentativas:
+                    cap.release()
+                    self.running = False
+                    messagebox.showwarning(
+                        "Erro de Acesso à Câmera",
+                        "Não foi possível receber imagem da câmera.\n\n"
+                        "Verifique se ela está ativa, desconectada ou se as "
+                        "Configurações de Privacidade de Câmera do Windows estão bloqueando o app."
+                    )
+                    abrir_configuracoes_camera_windows()
+                    break
+                time.sleep(0.03)
+                continue
+
+            tentativas_vazias = 0  # Reseta se ler com sucesso
 
             if self.recording:
                 if self.video_writer is None:
@@ -287,7 +319,11 @@ class VideoInstanceFrame(ctkinter.CTkFrame):
             h_orig, w_orig = frame.shape[:2]
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-            if not calibrado:
+            # NOVA LÓGICA DE BOTÃO: Calibra se for Arquivo de Vídeo (Auto) OU se o botão foi clicado (Câmera)
+            if (not self.is_hardware_camera and not self.calibrado) or (
+                    self.is_hardware_camera and self.solicitou_calibracao):
+                self.solicitou_calibracao = False  # Consome o clique do botão
+
                 seg_inp = cv2.resize(frame_rgb, (SEG_SIZE, SEG_SIZE)).transpose(2, 0, 1)[None, ...].astype(np.float32,
                                                                                                            copy=False) / 255.0
                 seg_inp = np.ascontiguousarray(seg_inp)
@@ -298,7 +334,9 @@ class VideoInstanceFrame(ctkinter.CTkFrame):
                 mask_v = cv2.resize(mask_v, (w_orig, h_orig), interpolation=cv2.INTER_NEAREST)
 
                 contours_v, _ = cv2.findContours(mask_v, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                if len(contours_v) == 0: continue
+                if len(contours_v) == 0:
+                    print("[Calibração] Falhou: Nenhum visor detectado.")
+                    continue
                 maior_cnt = max(contours_v, key=cv2.contourArea)
                 x_b, y_b, w_b, h_b = cv2.boundingRect(maior_cnt)
                 centro_x_visor = x_b + (w_b / 2)
@@ -321,7 +359,9 @@ class VideoInstanceFrame(ctkinter.CTkFrame):
                         int(min(w_orig, (pred[2] - dw) / ratio)), int(min(h_orig, (pred[3] - dh) / ratio))
                     ])
 
-                if len(caixas_p) == 0: continue
+                if len(caixas_p) == 0:
+                    print("[Calibração] Falhou: Nenhum ponteiro detectado.")
+                    continue
                 centro_x_ponteiros = np.mean([(b[0] + b[2]) / 2 for b in caixas_p])
                 centro_y_ponteiros = np.mean([(b[1] + b[3]) / 2 for b in caixas_p])
 
@@ -424,6 +464,7 @@ class VideoInstanceFrame(ctkinter.CTkFrame):
                     ])
                 caixas_ponteiros_estaticas = sorted(ponteiros_validos, key=lambda p: p[1])
 
+                params_letterbox_ponteiros = []
                 for ponteiro in caixas_ponteiros_estaticas:
                     x1, y1, x2, y2 = ponteiro
                     w_p_crop = x2 - x1;
@@ -466,7 +507,13 @@ class VideoInstanceFrame(ctkinter.CTkFrame):
                                 if val >= 10.0: val = 0.0
                                 p_superior_estatico = int(round(val))
 
-                calibrado = True
+                self.calibrado = True
+                print("[Calibração] Sistema calibrado com sucesso.")
+
+            # Se o sistema ainda não foi calibrado (ex: câmera ao iniciar), exibe o frame bruto sem inferência
+            if not self.calibrado:
+                self.atualizar_ui_elementos(frame_rgb, "Aguardando calibração...", 0, 0.0)
+                continue
 
             if rotation_step is not None:
                 frame_rgb = cv2.rotate(frame_rgb, rotation_step)
@@ -636,12 +683,9 @@ class AppMedidorMultiplo(ctkinter.CTk):
         self.geometry("1280x760")
         self.configure(fg_color="#1e1e1e")
 
-        # === ADICIONE ESTA LINHA PARA O ÍCONE DA JANELA ===
-        # Procura o ícone na pasta 'imagens' dentro do diretório base configurado no topo do seu script
         caminho_icone = os.path.join(DIRETORIO_BASE, "imagens", "icone.ico")
         if os.path.exists(caminho_icone):
             self.iconbitmap(caminho_icone)
-        # =================================================
 
         self.instancias_ativas = []
 
