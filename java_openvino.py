@@ -169,7 +169,6 @@ class VideoInstanceFrame(ctkinter.CTkFrame):
         self.recording = False
         self.video_writer = None
 
-        # Controle de calibração por evento/botão
         self.solicitou_calibracao = False
         self.calibrado = False
 
@@ -210,7 +209,6 @@ class VideoInstanceFrame(ctkinter.CTkFrame):
                                              hover_color="#bf360c", font=("Arial", 11), command=self.alternar_gravacao)
         self.btn_gravar.pack(side="left", padx=2)
 
-        # Adiciona o botão de calibração se for uma Câmera Física
         if self.is_hardware_camera:
             self.btn_calibrar = ctkinter.CTkButton(self.control_bar, text="🛠 Calibrar", width=70, height=25,
                                                    fg_color="#2e7d32",
@@ -250,18 +248,15 @@ class VideoInstanceFrame(ctkinter.CTkFrame):
         self.app_master.remover_instancia_grid(self)
 
     def loop_pipeline(self):
-        # RESPOSTA QUESTÃO 1: Abre usando CAP_DSHOW se for Windows para evitar frames nulos
         if self.is_hardware_camera and os.name == 'nt':
             cap = cv2.VideoCapture(self.video_source, cv2.CAP_DSHOW)
         else:
             cap = cv2.VideoCapture(self.video_source)
 
-        # RESPOSTA QUESTÃO 4: Força resolução estável padrão para compatibilidade
         if self.is_hardware_camera:
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-        # RESPOSTA QUESTÃO 3: Detecção inteligente de travamentos de privacidade/hardware
         tentativas_vazias = 0
         max_tentativas = 30
 
@@ -288,7 +283,6 @@ class VideoInstanceFrame(ctkinter.CTkFrame):
 
             ret, frame = cap.read()
 
-            # Validação inteligente se o dispositivo falhar em entregar frames
             if not ret or frame is None:
                 tentativas_vazias += 1
                 if tentativas_vazias > max_tentativas:
@@ -305,7 +299,7 @@ class VideoInstanceFrame(ctkinter.CTkFrame):
                 time.sleep(0.03)
                 continue
 
-            tentativas_vazias = 0  # Reseta se ler com sucesso
+            tentativas_vazias = 0
 
             if self.recording:
                 if self.video_writer is None:
@@ -319,10 +313,9 @@ class VideoInstanceFrame(ctkinter.CTkFrame):
             h_orig, w_orig = frame.shape[:2]
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-            # NOVA LÓGICA DE BOTÃO: Calibra se for Arquivo de Vídeo (Auto) OU se o botão foi clicado (Câmera)
             if (not self.is_hardware_camera and not self.calibrado) or (
                     self.is_hardware_camera and self.solicitou_calibracao):
-                self.solicitou_calibracao = False  # Consome o clique do botão
+                self.solicitou_calibracao = False
 
                 seg_inp = cv2.resize(frame_rgb, (SEG_SIZE, SEG_SIZE)).transpose(2, 0, 1)[None, ...].astype(np.float32,
                                                                                                            copy=False) / 255.0
@@ -501,7 +494,7 @@ class VideoInstanceFrame(ctkinter.CTkFrame):
                             if len(kpts) >= 6 and kpts[2] > 0.35 and kpts[5] > 0.35:
                                 angulo = math.degrees(math.atan2((kpts[4] - dh_p) / r_p - (kpts[1] - dh_p) / r_p,
                                                                  (kpts[3] - dw_p) / r_p - (
-                                                                             kpts[0] - dw_p) / r_p)) + 90.0
+                                                                         kpts[0] - dw_p) / r_p)) + 90.0
                                 if angulo < 0: angulo += 360.0
                                 val = round((angulo % 360.0) / 36.0, 1)
                                 if val >= 10.0: val = 0.0
@@ -510,7 +503,6 @@ class VideoInstanceFrame(ctkinter.CTkFrame):
                 self.calibrado = True
                 print("[Calibração] Sistema calibrado com sucesso.")
 
-            # Se o sistema ainda não foi calibrado (ex: câmera ao iniciar), exibe o frame bruto sem inferência
             if not self.calibrado:
                 self.atualizar_ui_elementos(frame_rgb, "Aguardando calibração...", 0, 0.0)
                 continue
@@ -549,15 +541,17 @@ class VideoInstanceFrame(ctkinter.CTkFrame):
                         if len(kpts) >= 6 and kpts[2] > 0.35 and kpts[5] > 0.35:
                             angulo_ajustated = math.degrees(math.atan2((kpts[4] - dh_p) / r_p - (kpts[1] - dh_p) / r_p,
                                                                        (kpts[3] - dw_p) / r_p - (
-                                                                                   kpts[0] - dw_p) / r_p)) + 90.0
+                                                                               kpts[0] - dw_p) / r_p)) + 90.0
                             if angulo_ajustated < 0: angulo_ajustated += 360.0
                             valor_original = round((angulo_ajustated % 360.0) / 36.0, 1)
+
                             if valor_original >= 10.0: valor_original = 0.0
 
                             decimais = int(round((valor_original - int(valor_original)) * 10))
                             if decimais % 2 != 0:
                                 valor_original = round(valor_original - 0.1, 1)
                                 if valor_original < 0.0: valor_original = 0.0
+
                             p_inferior_cache = valor_original
                         else:
                             p_inferior_cache = 0.0
@@ -600,12 +594,16 @@ class VideoInstanceFrame(ctkinter.CTkFrame):
                         if len(kpts) >= 6 and kpts[2] > 0.35 and kpts[5] > 0.35:
                             angulo_ajustated = math.degrees(math.atan2((kpts[4] - dh_p) / r_p - (kpts[1] - dh_p) / r_p,
                                                                        (kpts[3] - dw_p) / r_p - (
-                                                                                   kpts[0] - dw_p) / r_p)) + 90.0
+                                                                               kpts[0] - dw_p) / r_p)) + 90.0
                             if angulo_ajustated < 0: angulo_ajustated += 360.0
                             valor_original = round((angulo_ajustated % 360.0) / 36.0, 1)
+
                             if valor_original >= 10.0: valor_original = 0.0
 
                             p_superior_estatico = int(round(valor_original))
+
+                            if p_superior_estatico >= 10: p_superior_estatico = 0
+
                             p_superior_cache = p_superior_estatico
                         else:
                             p_superior_cache = p_superior_estatico
@@ -616,17 +614,26 @@ class VideoInstanceFrame(ctkinter.CTkFrame):
             else:
                 p_superior_cache = p_superior_estatico
 
+            if p_superior_cache >= 10: p_superior_cache = 0
+            if p_inferior_cache >= 10.0: p_inferior_cache = 0.0
+
+            # =========================================================================
+            # LÓGICA DE ATUALIZAÇÃO RESTRITA DO VISOR (OCR)
+            # =========================================================================
             deve_processar_ocr = False
             ponteiro_superior_mudou = (p_superior_cache != p_superior_anterior)
+
             if not ocr_inicial_realizado:
                 deve_processar_ocr = True
-            elif (completou_volta or ponteiro_superior_mudou) and not ocr_no_zero_realizado:
-                deve_processar_ocr = True
+            elif p_superior_cache == 0:
+                if (ponteiro_superior_mudou or completou_volta) and not ocr_no_zero_realizado:
+                    deve_processar_ocr = True
 
             p_superior_anterior = p_superior_cache
 
-            if not completou_volta and not ponteiro_superior_mudou:
+            if p_superior_cache != 0:
                 ocr_no_zero_realizado = False
+            # =========================================================================
 
             if deve_processar_ocr and bbox_visor_estatico is not None:
                 x_v, y_v, ww_v, hh_v = bbox_visor_estatico
@@ -733,9 +740,9 @@ class AppMedidorMultiplo(ctkinter.CTk):
         lbl = ctkinter.CTkLabel(janela_cam, text="Buscando dispositivos de vídeo...", font=("Arial", 12))
         lbl.pack(pady=15)
 
-        lista_indices = listar_cameras_disponiveis()
+        grid_indices = listar_cameras_disponiveis()
 
-        if not lista_indices:
+        if not grid_indices:
             lbl.configure(text="Nenhuma câmera física encontrada!", text_color="#c62828")
             btn_ok = ctkinter.CTkButton(janela_cam, text="Fechar", width=100, command=janela_cam.destroy)
             btn_ok.pack(pady=10)
@@ -743,12 +750,12 @@ class AppMedidorMultiplo(ctkinter.CTk):
 
         lbl.configure(text="Selecione a câmera desejada:")
 
-        opcoes_texto = [f"Dispositivo de Vídeo {i}" for i in lista_indices]
+        opcoes_texto = [f"Dispositivo de Vídeo {i}" for i in grid_indices]
         combo_cams = ctkinter.CTkComboBox(janela_cam, values=opcoes_texto, width=200)
         combo_cams.pack(pady=10)
 
         def confirmar_selecao():
-            idx_selecionado = lista_indices[opcoes_texto.index(combo_cams.get())]
+            idx_selecionado = grid_indices[opcoes_texto.index(combo_cams.get())]
             janela_cam.destroy()
             self.criar_nova_instancia_stream(idx_selecionado, f"📷 Live Cam #{idx_selecionado}")
 
@@ -781,3 +788,5 @@ class AppMedidorMultiplo(ctkinter.CTk):
 if __name__ == "__main__":
     app = AppMedidorMultiplo()
     app.mainloop()
+
+# pyinstaller --noconfirm --onefile --windowed --name="monitoração" --icon="imagens/icone.ico" --add-data "pesos;pesos" --add-data "imagens;imagens" --collect-data customtkinter --collect-all openvino java_openvino.py
