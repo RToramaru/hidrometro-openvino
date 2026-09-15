@@ -33,7 +33,8 @@ def formatar_dados_instancia(inst):
     p_sup = getattr(inst, 'p_superior_atual', 0)
     p_inf = getattr(inst, 'p_inferior_atual', 0.0)
 
-    valor_relogio = f"{ocr_str}.{p_sup}{int(p_inf)}"
+    p_inf = int(p_inf * 10)  # Converte para inteiro multiplicando por 10
+    valor_relogio = f"{ocr_str}.{p_sup}{p_inf}"
 
     return {
         "indiceCamera": inst.video_source,
