@@ -10,6 +10,7 @@ import subprocess
 from tkinter import filedialog, messagebox
 import customtkinter as ctkinter
 from PIL import Image
+import api_server
 
 # =========================================================
 # LÓGICA DE DETECÇÃO DE CAMINHOS PARA EXECUTÁVEL ÚNICO (.ONEFILE)
@@ -215,6 +216,10 @@ class VideoInstanceFrame(ctkinter.CTkFrame):
                                                    hover_color="#1b5e20", font=("Arial", 11, "bold"),
                                                    command=self.solicitar_calibracao)
             self.btn_calibrar.pack(side="left", padx=2)
+
+        self.texto_ocr_atual = "000000"
+        self.p_superior_atual = 0
+        self.p_inferior_atual = 0.0
 
         self.thread = threading.Thread(target=self.loop_pipeline, daemon=True)
         self.thread.start()
@@ -660,8 +665,11 @@ class VideoInstanceFrame(ctkinter.CTkFrame):
                         else:
                             ocr_no_zero_realizado = True
 
-            self.atualizar_ui_elementos(frame_estabilizado_rgb, texto_ocr_cache, p_superior_cache, p_inferior_cache)
+            self.texto_ocr_atual = texto_ocr_cache
+            self.p_superior_atual = p_superior_cache
+            self.p_inferior_atual = p_inferior_cache
 
+            self.atualizar_ui_elementos(frame_estabilizado_rgb, texto_ocr_cache, p_superior_cache, p_inferior_cache)
         cap.release()
 
     def atualizar_ui_elementos(self, frame_rgb, ocr, p_sup, p_inf):
@@ -696,6 +704,10 @@ class AppMedidorMultiplo(ctkinter.CTk):
 
         self.instancias_ativas = []
 
+        # Inicializa a API e obtém o endereço com a porta que foi aberta
+        api_server.set_app_instance(self)
+        self.url_api = api_server.iniciar_servidor_api(host="0.0.0.0", porta_inicial=8000)
+
         self.master_engine = HybridInferenceEngine()
         print("A carregar pipeline de modelos compartilhados...")
         self.model_visor = self.master_engine.load_model(MODELOS["visor"])
@@ -719,10 +731,41 @@ class AppMedidorMultiplo(ctkinter.CTk):
                                               command=self.adicionar_arquivo_video)
         self.btn_arquivo.pack(side="left", padx=5, pady=12)
 
+        # --- PAINEL INDICADOR DA API NA TELA ---
+        self.api_info_frame = ctkinter.CTkFrame(self.top_bar, fg_color="#1e1e1e", border_color="#3a3a3a", border_width=1)
+        self.api_info_frame.pack(side="right", padx=15, pady=8)
+
+        self.lbl_api = ctkinter.CTkLabel(
+            self.api_info_frame,
+            text=f"🌐 API: {self.url_api}",
+            font=("Consolas", 11, "bold"),
+            text_color="#00ff00"
+        )
+        self.lbl_api.pack(side="left", padx=(10, 5), pady=5)
+
+        self.btn_copiar_api = ctkinter.CTkButton(
+            self.api_info_frame,
+            text="Copiar Link",
+            width=80,
+            height=24,
+            font=("Arial", 10),
+            fg_color="#333333",
+            hover_color="#444444",
+            command=self.copiar_url_api
+        )
+        self.btn_copiar_api.pack(side="right", padx=(5, 10), pady=5)
+
         self.grid_scroll = ctkinter.CTkScrollableFrame(self, fg_color="transparent")
         self.grid_scroll.pack(side="top", fill="both", expand=True, padx=10, pady=5)
 
         self.grid_scroll.grid_columnconfigure((0, 1, 2, 3), weight=1, pad=10)
+
+    def copiar_url_api(self):
+        """Copia a URL da API para a área de transferência do Windows/SO."""
+        self.clipboard_clear()
+        self.clipboard_append(self.url_api)
+        self.btn_copiar_api.configure(text="Copiado! ✓")
+        self.after(2000, lambda: self.btn_copiar_api.configure(text="Copiar Link"))
 
     def adicionar_arquivo_video(self):
         caminho = filedialog.askopenfilename(filetypes=[("Vídeos", "*.mp4 *.avi *.mkv")])
@@ -790,3 +833,4 @@ if __name__ == "__main__":
     app.mainloop()
 
 # pyinstaller --noconfirm --onefile --windowed --name="monitoração" --icon="imagens/icone.ico" --add-data "pesos;pesos" --add-data "imagens;imagens" --collect-data customtkinter --collect-all openvino java_openvino.py
+# pyinstaller --noconfirm --onefile --windowed --name="monitoração" --icon="imagens/icone.ico" --add-data "pesos;pesos" --add-data "imagens;imagens" --collect-data customtkinter --collect-all openvino --hidden-import="uvicorn.logging" --hidden-import="uvicorn.loops" --hidden-import="uvicorn.loops.auto" --hidden-import="uvicorn.protocols" --hidden-import="uvicorn.protocols.http" --hidden-import="uvicorn.protocols.http.auto" --hidden-import="uvicorn.lifespan" --hidden-import="uvicorn.lifespan.on" java_openvino.py
