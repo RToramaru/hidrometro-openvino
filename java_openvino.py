@@ -130,14 +130,16 @@ class HybridInferenceEngineInstance:
         self.ov_compiled_model = None
         self.ov_infer_request = None
         self.input_name = None
+        self._infer_lock = threading.Lock()
 
     def infer(self, tensor_input):
         if self.backend in ["CUDA", "DIRECTML"]:
             return self.ort_session.run(None, {self.input_name: tensor_input})[0]
         else:
-            self.ov_infer_request.start_async([tensor_input])
-            self.ov_infer_request.wait()
-            return self.ov_infer_request.get_output_tensor().data
+            with self._infer_lock:
+                self.ov_infer_request.start_async([tensor_input])
+                self.ov_infer_request.wait()
+                return self.ov_infer_request.get_output_tensor().data.copy()
 
 
 def letterbox(im, new_shape=(640, 640), color=(114, 114, 114)):
